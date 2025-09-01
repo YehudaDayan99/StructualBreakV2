@@ -1,4 +1,4 @@
-# ADIA - Structural Breakpoint Detection Package
+# Structural Breakpoint Detection Package
 
 A modular package for generating features and tests detecting structural breakpoints in time series.
 
