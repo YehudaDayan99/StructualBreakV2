@@ -1,8 +1,8 @@
 """
 Wavelet21 method implementation for structural breakpoint detection.
 
-This is a placeholder implementation that demonstrates the interface
-for a wavelet-based structural breakpoint detection method.
+This implements the MODW (Maximal Overlap Discrete Wavelet Transform) methodology
+for robust multi-resolution structural break detection.
 """
 
 import numpy as np
@@ -10,11 +10,11 @@ from typing import Dict, Any, Tuple, Optional
 import time
 
 from ..base import BaseMethod
-from .wavelet_analysis import wavelet_decomposition, detect_breakpoints
+from .wavelet_analysis import build_features_for_id, ThresholdCache
 from .feature_extractor import extract_wavelet_predictors
 from .config import (
-    WAVELET_TYPE, DECOMPOSITION_LEVELS, THRESHOLD_METHOD,
-    THRESHOLD_FACTOR, MIN_BREAK_STRENGTH, SEED
+    WAVELET_TYPE, DECOMPOSITION_LEVELS, ALPHA, BOUNDARY_WIN_FRAC, 
+    BOUNDARY_WIN_MIN, LENGTH_BUCKET, MC_REPS, THRESHOLD_MODE, SEED, CACHE_FILE
 )
 
 
@@ -22,8 +22,8 @@ class Wavelet21Method(BaseMethod):
     """
     Wavelet21 method for structural breakpoint detection.
     
-    Wavelet-based method for detecting structural breakpoints using
-    wavelet decomposition and frequency domain analysis.
+    Implements MODW (Maximal Overlap Discrete Wavelet Transform) methodology
+    for robust multi-resolution structural break detection.
     """
     
     version = "1.0.0"
@@ -40,15 +40,22 @@ class Wavelet21Method(BaseMethod):
         # Set default Wavelet21-specific parameters
         self.wavelet_type = self.config.get('wavelet_type', WAVELET_TYPE)
         self.decomposition_levels = self.config.get('decomposition_levels', DECOMPOSITION_LEVELS)
-        self.threshold_method = self.config.get('threshold_method', THRESHOLD_METHOD)
-        self.threshold_factor = self.config.get('threshold_factor', THRESHOLD_FACTOR)
-        self.min_break_strength = self.config.get('min_break_strength', MIN_BREAK_STRENGTH)
+        self.alpha = self.config.get('alpha', ALPHA)
+        self.boundary_win_frac = self.config.get('boundary_win_frac', BOUNDARY_WIN_FRAC)
+        self.boundary_win_min = self.config.get('boundary_win_min', BOUNDARY_WIN_MIN)
+        self.length_bucket = self.config.get('length_bucket', LENGTH_BUCKET)
+        self.mc_reps = self.config.get('mc_reps', MC_REPS)
+        self.threshold_mode = self.config.get('threshold_mode', THRESHOLD_MODE)
         self.seed = self.config.get('seed', SEED)
+        self.cache_file = self.config.get('cache_file', CACHE_FILE)
+        
+        # Initialize threshold cache
+        self.threshold_cache = ThresholdCache(self.cache_file)
     
     def compute_predictors(self, values: np.ndarray, periods: np.ndarray, 
                           **kwargs) -> Tuple[Dict[str, float], Dict[str, Any]]:
         """
-        Compute structural break predictors using Wavelet21 method.
+        Compute structural break predictors using Wavelet21 MODW method.
         
         Args:
             values: Time series values
@@ -64,24 +71,9 @@ class Wavelet21Method(BaseMethod):
             # Set random seed for reproducibility
             np.random.seed(self.seed)
             
-            # Perform wavelet decomposition
-            wavelet_coeffs = wavelet_decomposition(
-                values, 
-                wavelet=self.wavelet_type,
-                levels=self.decomposition_levels
-            )
-            
-            # Detect breakpoints using wavelet analysis
-            breakpoints = detect_breakpoints(
-                wavelet_coeffs,
-                threshold_factor=self.threshold_factor,
-                threshold_method=self.threshold_method
-            )
-            
-            # Extract wavelet-based predictors
+            # Use MODW feature extraction
             predictors = extract_wavelet_predictors(
-                values, periods, wavelet_coeffs, breakpoints,
-                min_break_strength=self.min_break_strength
+                values, periods, self.threshold_cache
             )
             
             # Create metadata
@@ -93,8 +85,12 @@ class Wavelet21Method(BaseMethod):
                 'n_observations': len(values),
                 'wavelet_type': self.wavelet_type,
                 'decomposition_levels': self.decomposition_levels,
-                'n_breakpoints_detected': len(breakpoints),
-                'breakpoints': breakpoints.tolist() if len(breakpoints) > 0 else []
+                'alpha': self.alpha,
+                'threshold_mode': self.threshold_mode,
+                'boundary_win_frac': self.boundary_win_frac,
+                'boundary_win_min': self.boundary_win_min,
+                'mc_reps': self.mc_reps,
+                'cache_file': self.cache_file
             }
             
             return predictors, metadata
@@ -105,10 +101,14 @@ class Wavelet21Method(BaseMethod):
             default_predictors = {
                 'p_wavelet_break': 0.5,
                 'break_strength': 0.0,
-                'frequency_energy_ratio': 0.5,
-                'wavelet_variance_ratio': 0.5,
-                'dominant_frequency_shift': 0.0,
-                'confidence': 0.0
+                'confidence': 0.0,
+                'resid_kurtosis': 0.0,
+                'resid_skewness': 0.0,
+                'mean_diff': 0.0,
+                'log_var_ratio': 0.0,
+                'S_local_max_over_j': 0.0,
+                'cnt_local_sum_over_j': 0,
+                'log_energy_ratio_l2norm_over_j': 0.0
             }
             default_metadata = {
                 'method': 'wavelet21',
@@ -129,11 +129,17 @@ class Wavelet21Method(BaseMethod):
         if self.decomposition_levels <= 0:
             raise ValueError("decomposition_levels must be positive")
         
-        if self.threshold_factor <= 0:
-            raise ValueError("threshold_factor must be positive")
+        if self.alpha <= 0 or self.alpha >= 1:
+            raise ValueError("alpha must be between 0 and 1")
         
-        if self.min_break_strength < 0 or self.min_break_strength > 1:
-            raise ValueError("min_break_strength must be between 0 and 1")
+        if self.boundary_win_frac <= 0:
+            raise ValueError("boundary_win_frac must be positive")
+        
+        if self.boundary_win_min <= 0:
+            raise ValueError("boundary_win_min must be positive")
+        
+        if self.mc_reps <= 0:
+            raise ValueError("mc_reps must be positive")
         
         if self.seed < 0:
             raise ValueError("seed must be non-negative")
@@ -147,9 +153,11 @@ class Wavelet21Method(BaseMethod):
         """
         info = super().get_method_info()
         info.update({
-            'approach': 'Wavelet decomposition and frequency domain analysis',
-            'features': 'Multi-resolution analysis, frequency band detection, breakpoint localization',
+            'approach': 'MODW (Maximal Overlap Discrete Wavelet Transform)',
+            'features': 'Multi-resolution analysis, MODWT coefficients, Monte Carlo thresholds, residual diagnostics',
             'wavelet_type': self.wavelet_type,
-            'decomposition_levels': str(self.decomposition_levels)
+            'decomposition_levels': str(self.decomposition_levels),
+            'alpha': str(self.alpha),
+            'threshold_mode': self.threshold_mode
         })
         return info
