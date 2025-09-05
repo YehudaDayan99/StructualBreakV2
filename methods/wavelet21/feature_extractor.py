@@ -22,6 +22,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple, Optional, Union
 import warnings
+import logging
 
 # Core dependencies
 from scipy.stats import kurtosis, skew, ks_2samp
@@ -103,6 +104,46 @@ class ThresholdCache:
 # =============================
 # Utility Functions
 # =============================
+def _swt_details(x: np.ndarray, wavelet: str = 'sym4', J: int = 3) -> list:
+    """Sanity harness for SWT stability (as per PDF debugging guide).
+    
+    Args:
+        x: Input time series
+        wavelet: Wavelet name
+        J: Number of decomposition levels
+        
+    Returns:
+        List of detail coefficients, each as 1D array
+    """
+    coeffs = pywt.swt(x, wavelet, level=J, trim_approx=True, norm=True)
+    out = []
+    for c in coeffs:
+        if isinstance(c, tuple):
+            out.append(np.asarray(c[1]).reshape(-1))
+        else:
+            out.append(np.asarray(c).reshape(-1))
+    return out
+
+
+def _test_swt_stability(x: np.ndarray, wavelet: str = 'sym4', J: int = 3) -> bool:
+    """Test SWT stability with smoke test (as per PDF debugging guide).
+    
+    Args:
+        x: Input time series
+        wavelet: Wavelet name  
+        J: Number of decomposition levels
+        
+    Returns:
+        True if stable, False otherwise
+    """
+    try:
+        det = _swt_details(x, wavelet, J)
+        for j, Wj in enumerate(det, 1):
+            if not (Wj.ndim == 1 and Wj.size == x.size):
+                return False
+        return True
+    except Exception:
+        return False
 def _standardize(z: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """Standardize array to zero mean, unit variance."""
     m = float(np.mean(z))
@@ -123,7 +164,17 @@ def _arch_lm_pvalue(resid: np.ndarray, lags: int = 10) -> float:
 
 def _ljungbox_pvalue(resid: np.ndarray, lags: int = 10) -> float:
     # returns (lb_stat, lb_pvalue)
-    return float(acorr_ljungbox(resid, lags=lags, return_df=False)[1])
+    try:
+        # Ensure we have enough data and valid lag
+        if len(resid) <= lags:
+            return 1.0
+        result = acorr_ljungbox(resid, lags=lags, return_df=False)
+        if isinstance(result, tuple):
+            return float(result[1])
+        else:
+            return float(result.iloc[0, 1])  # p-value is in second column
+    except Exception:
+        return 1.0  # Return non-significant p-value on error
 
 
 def _modwt_coeffs(resid: np.ndarray, wavelet: str, J: int) -> Dict[int, np.ndarray]:
@@ -245,7 +296,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         if HAVE_ARCH:
             try:
                 am = arch_model(arma_resid, vol='Garch', p=1, q=1, dist='t')
-                r = am.fit(disp="off")
+                r = am.fit()
                 resid = r.std_resid
             except Exception:
                 resid = arma_resid
@@ -280,27 +331,44 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         if j not in W:
             continue  # Skip if this level doesn't exist
             
-        Wj = W[j]
-        # Ensure Wj is a proper numpy array
-        if not isinstance(Wj, np.ndarray):
-            Wj = np.asarray(Wj, dtype=float)
+        # Get detail coefficients robustly (as per PDF instructions)
+        Wj_raw = W[j]
+        if isinstance(Wj_raw, tuple):
+            Wj_raw = Wj_raw[1]  # detail (cD)
+        Wj = np.asarray(Wj_raw).reshape(-1)
+        nj = Wj.size
         
+        # Logging for debugging (as per PDF debugging guide)
+        logging.debug(f"Level {j}: Wj_raw type={type(Wj_raw)}, Wj shape={Wj.shape}, nj={nj}")
+        
+        if nj == 0:
+            logging.warning(f"Level {j}: Empty coefficients, skipping")
+            continue
+            
         thresh_j = thresholds.get(j, 2.0 * np.sqrt(2 * np.log(n_resid)))
         
-        # Local maxima over threshold
+        # Exceedance fraction
+        exceed_count = int(np.sum(np.abs(Wj) > thresh_j))
+        features[f"j{j}_exceed_count"] = float(exceed_count)
+        features[f"j{j}_exceed_frac"] = exceed_count / float(nj)
+        
+        # Localized stats (avoid reusing Wj - use Wj_win for windowed analysis)
+        # For boundary analysis, use a window around the boundary
+        win_lo = max(0, nj // 2 - 10)
+        win_hi = min(nj, nj // 2 + 10)
+        Wj_win = Wj[win_lo:win_hi]
+        S_j = float(np.max(np.abs(Wj_win))) if Wj_win.size else 0.0
+        features[f"j{j}_S_local_max"] = S_j
+        
+        # Local maxima over threshold (using full array)
         local_max = np.max(Wj)
         features[f"j{j}_local_max"] = float(local_max)
         features[f"j{j}_exceeds_thresh"] = float(local_max > thresh_j)
         
-        # Exceedance count
-        exceed_count = np.sum(np.abs(Wj) > thresh_j)
-        features[f"j{j}_exceed_count"] = float(exceed_count)
-        features[f"j{j}_exceed_frac"] = float(exceed_count / len(Wj))
-        
-        # Energy
-        energy_j = np.sum(Wj ** 2)
-        features[f"j{j}_energy"] = float(energy_j)
-        features[f"j{j}_energy_norm"] = float(energy_j / len(Wj))
+        # Energy (using full array)
+        energy_j = float(np.sum(Wj * Wj))
+        features[f"j{j}_energy"] = energy_j
+        features[f"j{j}_energy_norm"] = float(energy_j / nj)
     
     # 2. Cross-scale summaries
     all_max = [features[f"j{j}_local_max"] for j in range(1, actual_J + 1) if f"j{j}_local_max" in features]
@@ -341,15 +409,24 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     # 4. Residual diagnostics
     features["arch_lm_p"] = float(p_arch)
     
-    # Ljung-Box tests at different lags
+    # Ljung-Box tests at different lags (ensure lag < len(resid))
+    n_resid = len(resid)
     for lag in [5, 10, 15]:
-        lb_p = _ljungbox_pvalue(resid, lags=lag)
-        features[f"ljungbox_p_ac_{lag}"] = float(lb_p)
+        actual_lag = min(lag, n_resid - 1)
+        if actual_lag > 0:
+            lb_p = _ljungbox_pvalue(resid, lags=actual_lag)
+            features[f"ljungbox_p_ac_{lag}"] = float(lb_p)
+        else:
+            features[f"ljungbox_p_ac_{lag}"] = 1.0
     
     # Ljung-Box on squared residuals
     for lag in [5, 10, 15]:
-        lb_p_sq = _ljungbox_pvalue(resid ** 2, lags=lag)
-        features[f"ljungbox_p_ac2_{lag}"] = float(lb_p_sq)
+        actual_lag = min(lag, n_resid - 1)
+        if actual_lag > 0:
+            lb_p_sq = _ljungbox_pvalue(resid ** 2, lags=actual_lag)
+            features[f"ljungbox_p_ac2_{lag}"] = float(lb_p_sq)
+        else:
+            features[f"ljungbox_p_ac2_{lag}"] = 1.0
     
     # 5. Energy ratio L2 norm (cross-scale)
     if len(all_energy) > 1:
