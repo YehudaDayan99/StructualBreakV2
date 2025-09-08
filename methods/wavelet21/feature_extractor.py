@@ -74,12 +74,50 @@ class ThresholdCache:
         """Load existing cache from disk."""
         try:
             import json
+            import ast
+            import re
             with open(self.cache_path, 'r') as f:
                 data = json.load(f)
                 # Convert string keys back to tuples
                 for key_str, thresholds in data.items():
-                    n, J, wavelet, alpha = eval(key_str)
-                    self._cache[(n, J, wavelet, alpha)] = thresholds
+                    n: int
+                    J: int
+                    wavelet: str
+                    alpha: float
+                    parsed_ok = False
+                    # First try safe literal eval for tuple-like strings
+                    try:
+                        tpl = ast.literal_eval(key_str)
+                        if (
+                            isinstance(tpl, tuple)
+                            and len(tpl) == 4
+                            and isinstance(tpl[0], int)
+                            and isinstance(tpl[1], int)
+                            and isinstance(tpl[2], str)
+                            and isinstance(tpl[3], (int, float))
+                        ):
+                            n, J, wavelet, alpha = tpl
+                            parsed_ok = True
+                    except Exception:
+                        pass
+
+                    # Fallback: support legacy keys like "n100_J3_lawnormal_wla8_a0.05"
+                    if not parsed_ok:
+                        m = re.match(r"^n(\d+)_J(\d+)_[A-Za-z0-9]+_w([A-Za-z0-9]+)_a([0-9.]+)$", key_str)
+                        if m:
+                            n = int(m.group(1))
+                            J = int(m.group(2))
+                            wtoken = m.group(3)
+                            # Legacy had a leading 'w' in wavelet token; strip if present
+                            wavelet = wtoken[1:] if wtoken.startswith('w') else wtoken
+                            alpha = float(m.group(4))
+                            parsed_ok = True
+
+                    if parsed_ok:
+                        self._cache[(n, J, wavelet, float(alpha))] = thresholds
+                    else:
+                        # Skip unknown key formats silently
+                        continue
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
             pass  # Start with empty cache
     
