@@ -35,9 +35,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Optional, Sequence
+import io
+import contextlib
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 # Preferred import from repo layout; fallback to local file
 try:
@@ -175,17 +178,26 @@ def run_training(
 
     cache = ThresholdCache(cache_path)
     rows = []
-    for id_ in sel_ids:
+    for id_ in tqdm(sel_ids, desc="Wavelet21 (ids)", total=len(sel_ids)):
         df = X.xs(id_, level=0)
         vals = df["value"].to_numpy(float)
         per = df["period"].to_numpy(int)
-        feats = extract_wavelet_predictors(vals, per, thr_cache=cache, cfg=cfg)
+        # Silence optimizer/diagnostic chatter from downstream libs per-id
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            feats = extract_wavelet_predictors(vals, per, thr_cache=cache, cfg=cfg)
         feats["id"] = id_
         rows.append(feats)
 
     F = pd.DataFrame(rows).set_index("id").sort_index()
     F.to_csv(out_path)
     print(f"Saved {out_path} with shape {F.shape}")
+    # Final preview for quick inspection
+    try:
+        preview = pd.read_csv(out_path).head()
+        print("\nPreview (head):")
+        print(preview)
+    except Exception:
+        pass
 
 
 # -----------------------------
