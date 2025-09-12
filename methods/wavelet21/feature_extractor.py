@@ -333,6 +333,15 @@ def extract_wavelet_predictors(values: np.ndarray,
 
     return feats
 
+# --- Back-compat exports expected by methods/wavelet21/__init__.py ---
+
+def compute_break_strength_from_modw(features: Dict[str, float]) -> float:
+    """Legacy API: alias to our internal break-strength heuristic."""
+    return _compat_break_strength(features)
+
+def compute_wavelet_confidence_from_modw(features: Dict[str, float]) -> float:
+    """Legacy API: alias to our internal confidence heuristic."""
+    return _compat_confidence(features)
 
 # =============================
 # Defaults (legacy-safe)
