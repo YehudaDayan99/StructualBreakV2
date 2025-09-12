@@ -156,10 +156,11 @@ def _arch_lm_p(arr, lags=10) -> float:
 # Wavelet helpers
 # =============================
 def _swt_detail_coeffs(eps: np.ndarray, wavelet: str, J: int) -> Dict[int, np.ndarray]:
-    # Stationary Wavelet Transform (MODWT-like, no decimation)
     J_eff = min(J, pywt.swt_max_level(len(eps)))
+    if J_eff < 1:
+        return {}  # <<< add this guard
     coeffs = pywt.swt(eps, wavelet, level=J_eff, trim_approx=True, norm=True)
-    return {j: coeffs[j-1][1].astype(float) for j in range(1, J_eff+1)}  # detail coeffs
+    return {j: np.asarray(coeffs[j-1][1]).astype(float).ravel() for j in range(1, J_eff+1)}
 
 
 def _mad(x: np.ndarray) -> float:
@@ -246,11 +247,18 @@ def extract_wavelet_predictors(values: np.ndarray,
     # 2) SWT coeffs per family & period-aware contrasts
     B = _find_boundary(p)
 
+    
     for w in cfg.wavelets:
         dj_all = _swt_detail_coeffs(eps, w, cfg.J)
+        if not dj_all:
+            continue  # <<< nothing to do for this wavelet
         for j, d in dj_all.items():
+            d = np.asarray(d).ravel()  # <<< ensure array (not scalar)
+            if d.ndim == 0 or d.size == 0:
+                continue
             d_pre, d_post = d[pre_mask], d[post_mask]
 
+    
             # energy/var/robust scale per segment
             e0 = float(np.mean(d_pre**2)) if d_pre.size else np.nan
             e1 = float(np.mean(d_post**2)) if d_post.size else np.nan
