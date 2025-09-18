@@ -58,6 +58,8 @@ class WaveletConfig:
     null_model: Optional["NullModelCfg"] = None
     # Whether to use residual-first pipeline (off by default for backward compatibility)
     use_residuals: bool = False
+    # Contrast engine: "recon" (DWT level reconstruction) or "swt" (legacy)
+    contrast_engine: str = "recon"
 
 
 DEFAULT_CFG = WaveletConfig()
@@ -186,6 +188,50 @@ def _test_swt_stability(x: np.ndarray, wavelet: str = 'sym4', J: int = 3) -> boo
         return True
     except Exception:
         return False
+
+
+def _pad_to_pow2_periodic(x: np.ndarray) -> Tuple[np.ndarray, int]:
+    """Pad to next power of two using periodic wrap; return padded array and original length.
+    """
+    n = int(x.size)
+    if n <= 0:
+        return x.copy(), n
+    target = 1
+    while target < n:
+        target <<= 1
+    if target == n:
+        return x.copy(), n
+    reps = int(np.ceil(target / n))
+    x_rep = np.tile(x, reps)[:target]
+    return x_rep, n
+
+
+def _dwt_level_reconstruction(series: np.ndarray, wavelet: str, level: int, J: int) -> np.ndarray:
+    """Reconstruct N-length level-j detail component via DWT.
+
+    Uses periodic padding to next power-of-two for stable decomposition, then trims back.
+    """
+    x = np.asarray(series, dtype=float)
+    x_pad, n_orig = _pad_to_pow2_periodic(x)
+    wobj = pywt.Wavelet(wavelet)
+    max_level = pywt.dwt_max_level(data_len=x_pad.size, filter_len=wobj.dec_len)
+    actual_J = min(J, max_level)
+    lvl = min(level, actual_J)
+    coeffs = pywt.wavedec(x_pad, wavelet=wobj, level=actual_J, mode='periodization')
+    # coeffs = [cA_J, cD_J, cD_{J-1}, ..., cD_1]
+    # Zero all but cD_lvl
+    for j in range(1, actual_J + 1):
+        if j == lvl:
+            continue
+        coeffs[-j] = np.zeros_like(coeffs[-j])
+    # Optionally keep approximation zero to isolate detail energy
+    coeffs[0] = np.zeros_like(coeffs[0])
+    x_rec = pywt.waverec(coeffs, wavelet=wobj, mode='periodization')
+    # Ensure 1D and trim to original length
+    x_rec = np.asarray(x_rec, dtype=float).reshape(-1)
+    if x_rec.size > n_orig:
+        x_rec = x_rec[:n_orig]
+    return x_rec
 def _standardize(z: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     """Standardize array to zero mean, unit variance."""
     m = float(np.mean(z))
@@ -500,8 +546,8 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         Wj = np.asarray(Wj_raw).reshape(-1)
         nj = Wj.size
         
-        # Logging for debugging (as per PDF debugging guide)
-        logging.debug(f"Level {j}: Wj_raw type={type(Wj_raw)}, Wj shape={Wj.shape}, nj={nj}")
+        # Optional debug
+        # logging.debug(f"Level {j}: Wj_raw type={type(Wj_raw)}, Wj shape={Wj.shape}, nj={nj}")
         
         if nj == 0:
             logging.warning(f"Level {j}: Empty coefficients, skipping")
@@ -532,43 +578,51 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         features[f"j{j}_energy"] = energy_j
         features[f"j{j}_energy_norm"] = float(energy_j / nj)
     
-    # 2. Period-aware contrasts on residual MODWT (only when residuals path is active)
+    # 2. Period-aware contrasts on residuals (only when residuals path is active)
     if cfg.use_residuals and cfg.null_model is not None:
-        print(f"DEBUG: Entering contrast block, use_residuals={cfg.use_residuals}, null_model={cfg.null_model is not None}")
         pre_idx = np.flatnonzero(per == 0)
         post_idx = np.flatnonzero(per == 1)
         fam = cfg.wavelet
-        # Ensure we use full-length coefficients for contrasts
-        use_W = True
-        for j in range(1, actual_J + 1):
-            if j not in W or np.asarray(W[j]).reshape(-1).size != len(resid):
-                use_W = False
-                break
-        if not use_W:
-            # Force SWT detail coefficients aligned to full length
-            # Ensure even length for SWT
-            resid_even = resid if len(resid) % 2 == 0 else np.append(resid, resid[-1])
-            swt = pywt.swt(resid_even, wavelet=fam, level=min(cfg.J, pywt.swt_max_level(len(resid_even))), trim_approx=True, norm=True)
-            Wc = {j + 1: np.asarray(swt[j][1], dtype=float).reshape(-1) for j in range(len(swt))}
+        engine = (cfg.contrast_engine or "recon").lower()
+        if engine == "recon":
+            # DWT reconstruction-based per-level detail at full length
+            for j in range(1, actual_J + 1):
+                Wj_full = _dwt_level_reconstruction(resid, wavelet=fam, level=j, J=cfg.J)
+                pre_idx_clip = pre_idx[pre_idx < Wj_full.size]
+                post_idx_clip = post_idx[post_idx < Wj_full.size]
+                if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
+                    v0 = _safe_var(Wj_full[pre_idx_clip])
+                    v1 = _safe_var(Wj_full[post_idx_clip])
+                    m0 = _mad_normalized(Wj_full[pre_idx_clip])
+                    m1 = _mad_normalized(Wj_full[post_idx_clip])
+                    features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
+                    features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(m1 / m0))
         else:
-            Wc = {j: np.asarray(W[j]).reshape(-1) for j in W}
-
-        for j in range(1, len(Wc) + 1):
-            Wj = Wc[j]
-            # Guard indices within range
-            pre_idx_clip = pre_idx[pre_idx < Wj.size]
-            post_idx_clip = post_idx[post_idx < Wj.size]
-            print(f"DEBUG: L{j} Wj.size={Wj.size}, pre_clip={pre_idx_clip.size}, post_clip={post_idx_clip.size}")
-            if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
-                v0 = _safe_var(Wj[pre_idx_clip])
-                v1 = _safe_var(Wj[post_idx_clip])
-                m0 = _mad_normalized(Wj[pre_idx_clip])
-                m1 = _mad_normalized(Wj[post_idx_clip])
-                features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
-                features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(m1 / m0))
-                print(f"DEBUG: Added wav_{fam}_L{j}_var_logratio and wav_{fam}_L{j}_mad_logratio")
+            # Legacy SWT/MODWT path (best-effort)
+            # Ensure we use full-length coefficients for contrasts
+            use_W = True
+            for j in range(1, actual_J + 1):
+                if j not in W or np.asarray(W[j]).reshape(-1).size != len(resid):
+                    use_W = False
+                    break
+            if not use_W:
+                resid_even = resid if len(resid) % 2 == 0 else np.append(resid, resid[-1])
+                swt = pywt.swt(resid_even, wavelet=fam, level=min(cfg.J, pywt.swt_max_level(len(resid_even))), trim_approx=True, norm=True)
+                Wc = {j + 1: np.asarray(swt[j][1], dtype=float).reshape(-1) for j in range(len(swt))}
             else:
-                print(f"DEBUG: Skipped L{j} due to insufficient clips")
+                Wc = {j: np.asarray(W[j]).reshape(-1) for j in W}
+
+            for j in range(1, len(Wc) + 1):
+                Wj = Wc[j]
+                pre_idx_clip = pre_idx[pre_idx < Wj.size]
+                post_idx_clip = post_idx[post_idx < Wj.size]
+                if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
+                    v0 = _safe_var(Wj[pre_idx_clip])
+                    v1 = _safe_var(Wj[post_idx_clip])
+                    m0 = _mad_normalized(Wj[pre_idx_clip])
+                    m1 = _mad_normalized(Wj[post_idx_clip])
+                    features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
+                    features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(m1 / m0))
 
     # 3. Cross-scale summaries
     all_max = [features[f"j{j}_local_max"] for j in range(1, actual_J + 1) if f"j{j}_local_max" in features]
