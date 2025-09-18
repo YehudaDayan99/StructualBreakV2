@@ -54,6 +54,10 @@ class WaveletConfig:
     mc_reps: int = 400             # increase for higher-fidelity thresholds
     use_mc_thresholds: bool = True # if False, fallback to universal thresholds
     random_state: int = 42
+    # Optional residual-first configuration (unused until wired)
+    null_model: Optional["NullModelCfg"] = None
+    # Whether to use residual-first pipeline (off by default for backward compatibility)
+    use_residuals: bool = False
 
 
 DEFAULT_CFG = WaveletConfig()
@@ -230,19 +234,35 @@ def _modwt_coeffs(resid: np.ndarray, wavelet: str, J: int) -> Dict[int, np.ndarr
         warnings.warn(f"Requested J={J} but data length {len(data)} only supports J={actual_J}")
     
     try:
-        # Try MODWT first
+        # Try MODWT first; normalize output to 1D arrays of length len(data)
         if hasattr(pywt, "modwt"):
             Ws = pywt.modwt(data, wavelet=wavelet, level=actual_J, mode="periodization")
-            # Ensure Ws is a list of arrays
-            if isinstance(Ws, (list, tuple)):
-                return {j + 1: np.asarray(Ws[j], dtype=float) for j in range(len(Ws))}
+            # Normalize MODWT result
+            modwt_ok = False
+            if isinstance(Ws, np.ndarray) and Ws.ndim == 2 and Ws.shape[1] == len(data):
+                out = {j + 1: np.asarray(Ws[j, :], dtype=float).reshape(-1) for j in range(Ws.shape[0])}
+                modwt_ok = True
+            elif isinstance(Ws, (list, tuple)):
+                out = {}
+                modwt_ok = True
+                for j in range(len(Ws)):
+                    wj = Ws[j]
+                    if isinstance(wj, tuple):
+                        wj = wj[1] if len(wj) > 1 else wj[0]
+                    arr = np.asarray(wj, dtype=float).reshape(-1)
+                    if arr.size != len(data):
+                        modwt_ok = False
+                        break
+                    out[j + 1] = arr
             else:
-                # If Ws is not a list, convert it
-                return {j + 1: np.asarray(Ws, dtype=float) for j in range(actual_J)}
-        else:
-            # Fallback to SWT
-            swt = pywt.swt(data, wavelet=wavelet, level=actual_J, trim_approx=True, norm=True)
-            return {j + 1: np.asarray(swt[j][1], dtype=float) for j in range(len(swt))}
+                out = {}
+
+            if modwt_ok and out:
+                return out
+
+        # Fallback to SWT with full-length detail coefficients
+        swt = pywt.swt(data, wavelet=wavelet, level=actual_J, trim_approx=True, norm=True)
+        return {j + 1: np.asarray(swt[j][1], dtype=float).reshape(-1) for j in range(len(swt))}
     except Exception as e:
         warnings.warn(f"Wavelet transform failed: {e}. Using identity transform.")
         # Fallback: return the original data as a single "level"
@@ -304,6 +324,95 @@ def _get_thresholds(n: int, J: int, wavelet: str, alpha: float,
 
 
 # =============================
+# Residual-first (isolated additions; unused until wired)
+# =============================
+@dataclass
+class NullModelCfg:
+    model: str = "arima"             # placeholder for future "garch" option
+    arima_order: tuple = (1, 0, 1)
+    resid_law: str = "t"             # "normal" or "t"
+    min_len: int = 300               # fallback to z-score if shorter
+
+
+def fit_null_model(full_values: np.ndarray, cfg: NullModelCfg):
+    """
+    Fit a simple H0 on the full series and return standardized residuals and diagnostics.
+    Isolated helper; not used by the main pipeline until explicitly wired.
+    """
+    x = np.asarray(full_values, dtype=float)
+
+    # Fallback path for short or non-finite series
+    if len(x) < cfg.min_len or not np.isfinite(x).all():
+        m = float(np.nanmean(x))
+        s = float(np.nanstd(x)) if np.isfinite(np.nanstd(x)) else 1.0
+        s = s if s > 1e-12 else 1e-12
+        eps = (x - m) / s
+        meta = dict(law="normal", nu=np.nan, ljungbox_p=np.nan, archlm_p=np.nan)
+        return eps, meta
+
+    # ARIMA residuals as baseline H0
+    res = ARIMA(x, order=cfg.arima_order).fit(method="statespace")
+    resid = np.asarray(res.resid, dtype=float)
+    s = float(np.nanstd(resid))
+    s = s if s > 1e-12 else 1e-12
+    eps = resid / s
+
+    # Diagnostics: Ljung–Box on residuals and squared residuals
+    try:
+        lb_stat, lb_p = acorr_ljungbox(eps, lags=20, return_df=False)
+        if isinstance(lb_p, (list, tuple, np.ndarray)):
+            lb_p_val = float(lb_p[-1])
+        else:
+            lb_p_val = float(lb_p)
+    except Exception:
+        lb_p_val = np.nan
+
+    try:
+        lb2_stat, lb2_p = acorr_ljungbox(eps ** 2, lags=20, return_df=False)
+        if isinstance(lb2_p, (list, tuple, np.ndarray)):
+            lb2_p_val = float(lb2_p[-1])
+        else:
+            lb2_p_val = float(lb2_p)
+    except Exception:
+        lb2_p_val = np.nan
+
+    law = "t" if str(cfg.resid_law).lower().startswith("t") else "normal"
+    nu = 8.0 if law == "t" else np.nan
+
+    meta = dict(law=law, nu=nu, ljungbox_p=lb_p_val, archlm_p=lb2_p_val)
+    return eps, meta
+
+
+def h0_meta_to_feats(meta: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Map H0 diagnostics to flat feature dict. Not used until residual pipeline is enabled.
+    """
+    return {
+        "h0_ljungbox_p": float(meta.get("ljungbox_p", np.nan)) if meta.get("ljungbox_p") is not None else np.nan,
+        "h0_archlm_p": float(meta.get("archlm_p", np.nan)) if meta.get("archlm_p") is not None else np.nan,
+        "h0_err_is_t": 1.0 if meta.get("law") == "t" else 0.0,
+        "h0_t_nu": float(meta.get("nu", np.nan)) if meta.get("nu") is not None else np.nan,
+    }
+
+
+# =============================
+# Period-aware contrasts on residual MODWT (helpers)
+# =============================
+def _safe_var(x: np.ndarray) -> float:
+    v = float(np.nanvar(x, ddof=1)) if x.size > 1 else 0.0
+    return v + 1e-12
+
+
+def _mad_normalized(x: np.ndarray) -> float:
+    # Normalized MAD (approx. std under normality): 1.4826 * median(|x - median(x)|)
+    if x.size == 0:
+        return 1e-12
+    med = float(np.nanmedian(x))
+    mad = float(np.nanmedian(np.abs(x - med)))
+    return 1.4826 * mad + 1e-12
+
+
+# =============================
 # Feature Extraction
 # =============================
 def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray, 
@@ -325,13 +434,29 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     
     # Use pre-period for residual modeling
     per1 = per[:-1] == 1
-    
-    # Residual model under H0
-    arma_resid = _arma_resid(x_pre)
-    p_arch = _arch_lm_pvalue(arma_resid, lags=10)
-    if p_arch < 0.05:
-        # Try GARCH if ARCH test significant
-        if HAVE_ARCH:
+
+    # Residual model under H0 (flag-controlled)
+    if cfg.use_residuals and cfg.null_model is not None:
+        try:
+            resid, h0_meta = fit_null_model(values, cfg.null_model)
+        except Exception:
+            # Fallback to original ARMA residuals if null-model fitting fails
+            arma_resid = _arma_resid(x_pre)
+            p_arch = _arch_lm_pvalue(arma_resid, lags=10)
+            if p_arch < 0.05 and HAVE_ARCH:
+                try:
+                    am = arch_model(arma_resid, vol='Garch', p=1, q=1, dist='t')
+                    r = am.fit()
+                    resid = r.std_resid
+                except Exception:
+                    resid = arma_resid
+            else:
+                resid = arma_resid
+            h0_meta = {"ljungbox_p": np.nan, "archlm_p": np.nan, "law": "normal", "nu": np.nan}
+    else:
+        arma_resid = _arma_resid(x_pre)
+        p_arch = _arch_lm_pvalue(arma_resid, lags=10)
+        if p_arch < 0.05 and HAVE_ARCH:
             try:
                 am = arch_model(arma_resid, vol='Garch', p=1, q=1, dist='t')
                 r = am.fit()
@@ -340,8 +465,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
                 resid = arma_resid
         else:
             resid = arma_resid
-    else:
-        resid = arma_resid
+        h0_meta = {"ljungbox_p": np.nan, "archlm_p": np.nan, "law": "normal", "nu": np.nan}
     
     resid = _standardize(resid)
     
@@ -408,7 +532,45 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         features[f"j{j}_energy"] = energy_j
         features[f"j{j}_energy_norm"] = float(energy_j / nj)
     
-    # 2. Cross-scale summaries
+    # 2. Period-aware contrasts on residual MODWT (only when residuals path is active)
+    if cfg.use_residuals and cfg.null_model is not None:
+        print(f"DEBUG: Entering contrast block, use_residuals={cfg.use_residuals}, null_model={cfg.null_model is not None}")
+        pre_idx = np.flatnonzero(per == 0)
+        post_idx = np.flatnonzero(per == 1)
+        fam = cfg.wavelet
+        # Ensure we use full-length coefficients for contrasts
+        use_W = True
+        for j in range(1, actual_J + 1):
+            if j not in W or np.asarray(W[j]).reshape(-1).size != len(resid):
+                use_W = False
+                break
+        if not use_W:
+            # Force SWT detail coefficients aligned to full length
+            # Ensure even length for SWT
+            resid_even = resid if len(resid) % 2 == 0 else np.append(resid, resid[-1])
+            swt = pywt.swt(resid_even, wavelet=fam, level=min(cfg.J, pywt.swt_max_level(len(resid_even))), trim_approx=True, norm=True)
+            Wc = {j + 1: np.asarray(swt[j][1], dtype=float).reshape(-1) for j in range(len(swt))}
+        else:
+            Wc = {j: np.asarray(W[j]).reshape(-1) for j in W}
+
+        for j in range(1, len(Wc) + 1):
+            Wj = Wc[j]
+            # Guard indices within range
+            pre_idx_clip = pre_idx[pre_idx < Wj.size]
+            post_idx_clip = post_idx[post_idx < Wj.size]
+            print(f"DEBUG: L{j} Wj.size={Wj.size}, pre_clip={pre_idx_clip.size}, post_clip={post_idx_clip.size}")
+            if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
+                v0 = _safe_var(Wj[pre_idx_clip])
+                v1 = _safe_var(Wj[post_idx_clip])
+                m0 = _mad_normalized(Wj[pre_idx_clip])
+                m1 = _mad_normalized(Wj[post_idx_clip])
+                features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
+                features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(m1 / m0))
+                print(f"DEBUG: Added wav_{fam}_L{j}_var_logratio and wav_{fam}_L{j}_mad_logratio")
+            else:
+                print(f"DEBUG: Skipped L{j} due to insufficient clips")
+
+    # 3. Cross-scale summaries
     all_max = [features[f"j{j}_local_max"] for j in range(1, actual_J + 1) if f"j{j}_local_max" in features]
     all_exceed = [features[f"j{j}_exceed_count"] for j in range(1, actual_J + 1) if f"j{j}_exceed_count" in features]
     all_energy = [features[f"j{j}_energy"] for j in range(1, actual_J + 1) if f"j{j}_energy" in features]
@@ -417,7 +579,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     features["cnt_local_sum_over_j"] = float(np.sum(all_exceed)) if all_exceed else 0.0
     features["energy_sum_over_j"] = float(np.sum(all_energy)) if all_energy else 0.0
     
-    # 3. Segment contrasts (pre vs post)
+    # 4. Segment contrasts (pre vs post)
     if len(x_pre) > 0 and len(x_post) > 0:
         # Energy ratios
         energy_pre = np.sum(x_pre ** 2)
@@ -444,8 +606,17 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         features["ks_stat_abs"] = float(ks_stat_abs)
         features["ks_p_abs"] = float(ks_p_abs)
     
-    # 4. Residual diagnostics
-    features["arch_lm_p"] = float(p_arch)
+    # 5. Residual diagnostics
+    # Maintain existing arch_lm_p when available (for backward compatibility)
+    try:
+        arch_p = _arch_lm_pvalue(np.asarray(resid, dtype=float), lags=10)
+    except Exception:
+        arch_p = np.nan
+    features["arch_lm_p"] = float(arch_p) if arch_p == arch_p else np.nan
+
+    # If residual-first path used, also expose h0_* diagnostics
+    if cfg.use_residuals and cfg.null_model is not None and isinstance(h0_meta, dict):
+        features.update(h0_meta_to_feats(h0_meta))
     
     # Ljung-Box tests at different lags (ensure lag < len(resid))
     n_resid = len(resid)
@@ -466,7 +637,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         else:
             features[f"ljungbox_p_ac2_{lag}"] = 1.0
     
-    # 5. Energy ratio L2 norm (cross-scale)
+    # 6. Energy ratio L2 norm (cross-scale)
     if len(all_energy) > 1:
         energy_norm = np.linalg.norm(all_energy)
         features["log_energy_ratio_l2norm_over_j"] = float(np.log(energy_norm + 1e-12))
