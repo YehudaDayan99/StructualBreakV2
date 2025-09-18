@@ -55,18 +55,25 @@ pred_df, meta_df = run_batch(
 ### Using Wavelet21 Method
 
 ```python
-from StructualBreak import run_batch
+from StructualBreakV2 import run_batch
 
+# Residual-first + period-aware contrasts (reconstruction engine)
 pred_df, meta_df = run_batch(
     input_parquet='X_train.parquet',
     out_pred_parquet='X_train_predictors.parquet',
     out_meta_parquet='X_train_metadata.parquet',
     method='wavelet21',
-    wavelet_type='db4',
-    decomposition_levels=4,
-    threshold_factor=0.1,
-    n_jobs=4,
-    verbose=True
+    # Wavelet21 accepts method-specific parameters via the config dict:
+    config={
+        'wavelet': 'sym4',
+        'J': 3,
+        'alpha': 0.05,
+        'use_residuals': True,
+        'contrast_engine': 'recon',  # or 'swt' for legacy contrasts
+        # null_model uses defaults; override via nested fields if needed
+    },
+    n_jobs=2,
+    verbose=True,
 )
 ```
 

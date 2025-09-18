@@ -219,6 +219,9 @@ def main():
     args = ap.parse_args()
 
     cfg = WaveletConfig(wavelet=args.wavelet, J=args.J, alpha=args.alpha)
+    # Enable residual-first + period-aware contrasts (DWT reconstruction) via config if desired
+    # cfg.use_residuals = True
+    # cfg.contrast_engine = "recon"  # or "swt" for legacy
 
     if not args.skip_demo:
         run_synthetic_demo(cfg, cache_path=args.cache)
