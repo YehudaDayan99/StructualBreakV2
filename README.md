@@ -77,6 +77,34 @@ pred_df, meta_df = run_batch(
 )
 ```
 
+### Wavelet21 – advanced options (residual-first uplift)
+
+These options are opt-in via the `config` dict (defaults preserve legacy behavior).
+
+```python
+config={
+  'wavelet': 'sym4',        # mother wavelet (e.g., 'sym4', 'db8')
+  'J': 3,                   # levels (capped by signal length)
+  'alpha': 0.05,            # exceedance/MC level
+  'use_residuals': True,    # residual-first pipeline (H0 fit on full series)
+  'contrast_engine': 'recon',   # 'recon' (DWT reconstruction) or 'coef_swt' (SWT; shift-invariant)
+  'wavelets': ('sym4','db8'),   # multi-family sweep (optional)
+  'windows': (16,32,64),    # boundary-local windows (optional)
+}
+```
+
+New columns (per wavelet family `{w}` and level `L{j}`):
+- Contrasts: `wav_{w}_L{j}_var_logratio`, `wav_{w}_L{j}_mad_logratio`, `wav_{w}_L{j}_energy_logratio`
+- Boundary-local: `wav_{w}_L{j}_localmax_w{16|32|64}`, `wav_{w}_L{j}_exceed_w{16|32|64}` (MC-calibrated; cached)
+- Coefficient-domain tests: `wav_{w}_L{j}_ttest_stat_signed`, `wav_{w}_L{j}_ttest_neglog10p`, `wav_{w}_L{j}_ftest_neglog10p`
+
+Residual diagnostics (with `use_residuals=True`):
+- `h0_ljungbox_p`, `h0_archlm_p`, `h0_err_is_t`, `h0_t_nu`, plus `h0_lb_p_resid2`, `h0_kurtosis_resid`
+
+Notes:
+- `'coef_swt'` engine computes contrasts on SWT detail coefficients (shift-invariant). If SWT is unusable on a series, it safely falls back to `'recon'` to preserve columns.
+- `ThresholdCache` is re-used to store MC thresholds for boundary features, keyed by `(n=window, J, wavelet, alpha)`.
+
 ### Single Series Analysis
 
 ```python

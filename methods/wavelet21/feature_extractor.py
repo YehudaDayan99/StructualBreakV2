@@ -60,6 +60,10 @@ class WaveletConfig:
     use_residuals: bool = False
     # Contrast engine: "recon" (DWT level reconstruction) or "swt" (legacy)
     contrast_engine: str = "recon"
+    # Windows for boundary-local features (Step 3)
+    windows: Tuple[int, ...] = (16, 32, 64)
+    # Multi-family support (Step 4). If empty/None, falls back to single wavelet.
+    wavelets: Tuple[str, ...] = ("sym4",)
 
 
 DEFAULT_CFG = WaveletConfig()
@@ -458,6 +462,25 @@ def _mad_normalized(x: np.ndarray) -> float:
     return 1.4826 * mad + 1e-12
 
 
+def _swt_detail_coeffs(x: np.ndarray, wavelet: str, J: int) -> Dict[int, np.ndarray]:
+    """Return SWT detail coefficients per level as full-length 1D arrays.
+    Caps J to swt_max_level and trims/reshapes for consistency.
+    """
+    x = np.asarray(x, dtype=float).reshape(-1)
+    # Ensure even length for SWT
+    x_even = x if (x.size % 2 == 0) else np.append(x, x[-1])
+    J_eff = min(J, pywt.swt_max_level(len(x_even)))
+    if J_eff <= 0:
+        return {1: x_even.copy()}
+    coeffs = pywt.swt(x_even, wavelet=wavelet, level=J_eff, trim_approx=True, norm=True)
+    # coeffs is list of (cA_j, cD_j) from j=1..J_eff
+    details: Dict[int, np.ndarray] = {}
+    for j in range(1, J_eff + 1):
+        cD = np.asarray(coeffs[j - 1][1], dtype=float).reshape(-1)
+        details[j] = cD
+    return details
+
+
 # =============================
 # Feature Extraction
 # =============================
@@ -515,125 +538,201 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     
     resid = _standardize(resid)
     
-    # MODWT/SWT coefficients
-    W = _modwt_coeffs(resid, wavelet=cfg.wavelet, J=cfg.J)
+    # Determine families to compute (Step 4)
+    families = list(getattr(cfg, "wavelets", None) or [cfg.wavelet])
     
-    # Get actual J used (may be less than requested)
-    actual_J = len(W)
-    
-    # Thresholds (MC or universal) with bucketing by residual length
-    n_resid = len(resid)
-    bucket_n = (n_resid // cfg.length_bucket) * cfg.length_bucket
-    bucket_n = max(bucket_n, cfg.length_bucket)
-    
-    if cfg.use_mc_thresholds:
-        thresholds = _get_thresholds(bucket_n, cfg.J, cfg.wavelet, cfg.alpha, thr_cache, cfg)
-    else:
-        # Universal thresholds (simplified)
-        thresholds = {j: 2.0 * np.sqrt(2 * np.log(n_resid)) for j in range(1, actual_J + 1)}
-    
-    features = {}
-    
-    # 1. Scale-specific local maxima and exceedances
-    for j in range(1, actual_J + 1):
-        if j not in W:
-            continue  # Skip if this level doesn't exist
+    for fam in families:
+        # MODWT/SWT coefficients (for summaries)
+        W = _modwt_coeffs(resid, wavelet=fam, J=cfg.J)
+        # Get actual J used (may be less than requested)
+        actual_J = len(W)
+        
+        # Thresholds (MC or universal) with bucketing by residual length
+        n_resid = len(resid)
+        bucket_n = (n_resid // cfg.length_bucket) * cfg.length_bucket
+        bucket_n = max(bucket_n, cfg.length_bucket)
+        
+        if cfg.use_mc_thresholds:
+            thresholds = _get_thresholds(bucket_n, cfg.J, cfg.wavelet, cfg.alpha, thr_cache, cfg)
+        else:
+            # Universal thresholds (simplified)
+            thresholds = {j: 2.0 * np.sqrt(2 * np.log(n_resid)) for j in range(1, actual_J + 1)}
+        
+        if 'features' not in locals():
+            features = {}
+        
+        # 1. Scale-specific local maxima and exceedances
+        for j in range(1, actual_J + 1):
+            if j not in W:
+                continue  # Skip if this level doesn't exist
             
-        # Get detail coefficients robustly (as per PDF instructions)
-        Wj_raw = W[j]
-        if isinstance(Wj_raw, tuple):
-            Wj_raw = Wj_raw[1]  # detail (cD)
-        Wj = np.asarray(Wj_raw).reshape(-1)
-        nj = Wj.size
+            # Get detail coefficients robustly (as per PDF instructions)
+            Wj_raw = W[j]
+            if isinstance(Wj_raw, tuple):
+                Wj_raw = Wj_raw[1]  # detail (cD)
+            Wj = np.asarray(Wj_raw).reshape(-1)
+            nj = Wj.size
         
         # Optional debug
         # logging.debug(f"Level {j}: Wj_raw type={type(Wj_raw)}, Wj shape={Wj.shape}, nj={nj}")
         
-        if nj == 0:
-            logging.warning(f"Level {j}: Empty coefficients, skipping")
-            continue
+            if nj == 0:
+                logging.warning(f"Level {j}: Empty coefficients, skipping")
+                continue
             
-        thresh_j = thresholds.get(j, 2.0 * np.sqrt(2 * np.log(n_resid)))
+            thresh_j = thresholds.get(j, 2.0 * np.sqrt(2 * np.log(n_resid)))
         
-        # Exceedance fraction
-        exceed_count = int(np.sum(np.abs(Wj) > thresh_j))
-        features[f"j{j}_exceed_count"] = float(exceed_count)
-        features[f"j{j}_exceed_frac"] = exceed_count / float(nj)
+            # Exceedance fraction
+            exceed_count = int(np.sum(np.abs(Wj) > thresh_j))
+            features[f"j{j}_exceed_count"] = float(exceed_count)
+            features[f"j{j}_exceed_frac"] = exceed_count / float(nj)
         
-        # Localized stats (avoid reusing Wj - use Wj_win for windowed analysis)
-        # For boundary analysis, use a window around the boundary
-        win_lo = max(0, nj // 2 - 10)
-        win_hi = min(nj, nj // 2 + 10)
-        Wj_win = Wj[win_lo:win_hi]
-        S_j = float(np.max(np.abs(Wj_win))) if Wj_win.size else 0.0
-        features[f"j{j}_S_local_max"] = S_j
+            # Localized stats (avoid reusing Wj - use Wj_win for windowed analysis)
+            # For boundary analysis, use a window around the boundary
+            win_lo = max(0, nj // 2 - 10)
+            win_hi = min(nj, nj // 2 + 10)
+            Wj_win = Wj[win_lo:win_hi]
+            S_j = float(np.max(np.abs(Wj_win))) if Wj_win.size else 0.0
+            features[f"j{j}_S_local_max"] = S_j
         
-        # Local maxima over threshold (using full array)
-        local_max = np.max(Wj)
-        features[f"j{j}_local_max"] = float(local_max)
-        features[f"j{j}_exceeds_thresh"] = float(local_max > thresh_j)
+            # Local maxima over threshold (using full array)
+            local_max = np.max(Wj)
+            features[f"j{j}_local_max"] = float(local_max)
+            features[f"j{j}_exceeds_thresh"] = float(local_max > thresh_j)
         
-        # Energy (using full array)
-        energy_j = float(np.sum(Wj * Wj))
-        features[f"j{j}_energy"] = energy_j
-        features[f"j{j}_energy_norm"] = float(energy_j / nj)
+            # Energy (using full array)
+            energy_j = float(np.sum(Wj * Wj))
+            features[f"j{j}_energy"] = energy_j
+            features[f"j{j}_energy_norm"] = float(energy_j / nj)
     
-    # 2. Period-aware contrasts on residuals (only when residuals path is active)
-    if cfg.use_residuals and cfg.null_model is not None:
-        pre_idx = np.flatnonzero(per == 0)
-        post_idx = np.flatnonzero(per == 1)
-        fam = cfg.wavelet
-        engine = (cfg.contrast_engine or "recon").lower()
-        if engine == "recon":
-            # DWT reconstruction-based per-level detail at full length
-            for j in range(1, actual_J + 1):
-                Wj_full = _dwt_level_reconstruction(resid, wavelet=fam, level=j, J=cfg.J)
-                pre_idx_clip = pre_idx[pre_idx < Wj_full.size]
-                post_idx_clip = post_idx[post_idx < Wj_full.size]
-                if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
-                    v0 = _safe_var(Wj_full[pre_idx_clip])
-                    v1 = _safe_var(Wj_full[post_idx_clip])
-                    m0 = _mad_normalized(Wj_full[pre_idx_clip])
-                    m1 = _mad_normalized(Wj_full[post_idx_clip])
-                    features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
-                    features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(m1 / m0))
-        else:
-            # Legacy SWT/MODWT path (best-effort)
-            # Ensure we use full-length coefficients for contrasts
-            use_W = True
-            for j in range(1, actual_J + 1):
-                if j not in W or np.asarray(W[j]).reshape(-1).size != len(resid):
-                    use_W = False
-                    break
-            if not use_W:
-                resid_even = resid if len(resid) % 2 == 0 else np.append(resid, resid[-1])
-                swt = pywt.swt(resid_even, wavelet=fam, level=min(cfg.J, pywt.swt_max_level(len(resid_even))), trim_approx=True, norm=True)
-                Wc = {j + 1: np.asarray(swt[j][1], dtype=float).reshape(-1) for j in range(len(swt))}
-            else:
-                Wc = {j: np.asarray(W[j]).reshape(-1) for j in W}
+        # 2. Period-aware contrasts on residuals (only when residuals path is active)
+        if cfg.use_residuals and cfg.null_model is not None:
+            pre_idx = np.flatnonzero(per == 0)
+            post_idx = np.flatnonzero(per == 1)
+            engine = (cfg.contrast_engine or "recon").lower()
+            if engine == "recon":
+                # DWT reconstruction-based per-level detail at full length
+                for j in range(1, actual_J + 1):
+                    Wj_full = _dwt_level_reconstruction(resid, wavelet=fam, level=j, J=cfg.J)
+                    pre_idx_clip = pre_idx[pre_idx < Wj_full.size]
+                    post_idx_clip = post_idx[post_idx < Wj_full.size]
+                    if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
+                        v0 = _safe_var(Wj_full[pre_idx_clip])
+                        v1 = _safe_var(Wj_full[post_idx_clip])
+                        m0 = _mad_normalized(Wj_full[pre_idx_clip])
+                        m1 = _mad_normalized(Wj_full[post_idx_clip])
+                        features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
+                        features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(m1 / m0))
+                        # Energy shift per level
+                        e0 = float(np.mean(Wj_full[pre_idx_clip] ** 2)) + 1e-12
+                        e1 = float(np.mean(Wj_full[post_idx_clip] ** 2)) + 1e-12
+                        features[f"wav_{fam}_L{j}_energy_logratio"] = float(np.log(e1 / e0))
+                        # Step 6: Welch t-test and F-test
+                        try:
+                            from scipy import stats as _stats
+                            d0 = np.asarray(Wj_full[pre_idx_clip], float)
+                            d1 = np.asarray(Wj_full[post_idx_clip], float)
+                            if d0.size > 3 and d1.size > 3:
+                                t_stat, t_p = _stats.ttest_ind(d1, d0, equal_var=False, nan_policy="omit")
+                                features[f"wav_{fam}_L{j}_ttest_stat_signed"] = float(t_stat)
+                                t_p = float(t_p) if np.isfinite(t_p) and t_p > 0 else 1e-300
+                                features[f"wav_{fam}_L{j}_ttest_neglog10p"] = float(-np.log10(t_p))
+                                # F two-tailed based on variance ratio
+                                var0 = float(np.nanvar(d0, ddof=1)) + 1e-12
+                                var1 = float(np.nanvar(d1, ddof=1)) + 1e-12
+                                F = var1 / var0
+                                df1, df0 = d1.size - 1, d0.size - 1
+                                from scipy import stats as _s
+                                p_f = 2 * min(_s.f.cdf(F, df1, df0), 1 - _s.f.cdf(F, df1, df0))
+                                p_f = float(p_f) if np.isfinite(p_f) and p_f > 0 else 1e-300
+                                features[f"wav_{fam}_L{j}_ftest_neglog10p"] = float(-np.log10(p_f))
+                        except Exception:
+                            pass
+            else:  # engine == "coef_swt"
+                dj = _swt_detail_coeffs(resid, fam, cfg.J)
+                # Detect unusable SWT output (empty or degenerate sizes)
+                swt_usable = bool(dj) and all(isinstance(v, np.ndarray) and v.size > 1 for v in dj.values())
+                if swt_usable:
+                    for j, d in dj.items():
+                        # Align masks to coeff length
+                        pre_idx_clip = pre_idx[pre_idx < d.size]
+                        post_idx_clip = post_idx[post_idx < d.size]
+                        if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
+                            d0, d1 = d[pre_idx_clip], d[post_idx_clip]
+                            v0, v1 = _safe_var(d0), _safe_var(d1)
+                            s0, s1 = _mad_normalized(d0), _mad_normalized(d1)
+                            features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
+                            features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(s1 / s0))
+                            # Energy shift per level on coefficients
+                            e0 = float(np.mean(d0 ** 2)) + 1e-12
+                            e1 = float(np.mean(d1 ** 2)) + 1e-12
+                            features[f"wav_{fam}_L{j}_energy_logratio"] = float(np.log(e1 / e0))
+                            # Step 6: Welch t-test and F-test
+                            try:
+                                from scipy import stats as _stats
+                                if d0.size > 3 and d1.size > 3:
+                                    t_stat, t_p = _stats.ttest_ind(d1, d0, equal_var=False, nan_policy="omit")
+                                    features[f"wav_{fam}_L{j}_ttest_stat_signed"] = float(t_stat)
+                                    t_p = float(t_p) if np.isfinite(t_p) and t_p > 0 else 1e-300
+                                    features[f"wav_{fam}_L{j}_ttest_neglog10p"] = float(-np.log10(t_p))
+                                    var0 = float(np.nanvar(d0, ddof=1)) + 1e-12
+                                    var1 = float(np.nanvar(d1, ddof=1)) + 1e-12
+                                    F = var1 / var0
+                                    df1, df0 = d1.size - 1, d0.size - 1
+                                    from scipy import stats as _s
+                                    p_f = 2 * min(_s.f.cdf(F, df1, df0), 1 - _s.f.cdf(F, df1, df0))
+                                    p_f = float(p_f) if np.isfinite(p_f) and p_f > 0 else 1e-300
+                                    features[f"wav_{fam}_L{j}_ftest_neglog10p"] = float(-np.log10(p_f))
+                            except Exception:
+                                pass
+                else:
+                    # Fallback to reconstruction engine per-level to guarantee contrasts
+                    for j in range(1, actual_J + 1):
+                        Wj_full = _dwt_level_reconstruction(resid, wavelet=fam, level=j, J=cfg.J)
+                        pre_idx_clip = pre_idx[pre_idx < Wj_full.size]
+                        post_idx_clip = post_idx[post_idx < Wj_full.size]
+                        if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
+                            v0 = _safe_var(Wj_full[pre_idx_clip])
+                            v1 = _safe_var(Wj_full[post_idx_clip])
+                            s0 = _mad_normalized(Wj_full[pre_idx_clip])
+                            s1 = _mad_normalized(Wj_full[post_idx_clip])
+                            features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
+                            features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(s1 / s0))
+                            # Energy shift per level
+                            e0 = float(np.mean(Wj_full[pre_idx_clip] ** 2)) + 1e-12
+                            e1 = float(np.mean(Wj_full[post_idx_clip] ** 2)) + 1e-12
+                            features[f"wav_{fam}_L{j}_energy_logratio"] = float(np.log(e1 / e0))
+                            # Step 6: Welch t-test and F-test
+                            try:
+                                from scipy import stats as _stats
+                                d0 = np.asarray(Wj_full[pre_idx_clip], float)
+                                d1 = np.asarray(Wj_full[post_idx_clip], float)
+                                if d0.size > 3 and d1.size > 3:
+                                    t_stat, t_p = _stats.ttest_ind(d1, d0, equal_var=False, nan_policy="omit")
+                                    features[f"wav_{fam}_L{j}_ttest_stat_signed"] = float(t_stat)
+                                    t_p = float(t_p) if np.isfinite(t_p) and t_p > 0 else 1e-300
+                                    features[f"wav_{fam}_L{j}_ttest_neglog10p"] = float(-np.log10(t_p))
+                                    var0 = float(np.nanvar(d0, ddof=1)) + 1e-12
+                                    var1 = float(np.nanvar(d1, ddof=1)) + 1e-12
+                                    F = var1 / var0
+                                    df1, df0 = d1.size - 1, d0.size - 1
+                                    from scipy import stats as _s
+                                    p_f = 2 * min(_s.f.cdf(F, df1, df0), 1 - _s.f.cdf(F, df1, df0))
+                                    p_f = float(p_f) if np.isfinite(p_f) and p_f > 0 else 1e-300
+                                    features[f"wav_{fam}_L{j}_ftest_neglog10p"] = float(-np.log10(p_f))
+                            except Exception:
+                                pass
 
-            for j in range(1, len(Wc) + 1):
-                Wj = Wc[j]
-                pre_idx_clip = pre_idx[pre_idx < Wj.size]
-                post_idx_clip = post_idx[post_idx < Wj.size]
-                if pre_idx_clip.size > 1 and post_idx_clip.size > 1:
-                    v0 = _safe_var(Wj[pre_idx_clip])
-                    v1 = _safe_var(Wj[post_idx_clip])
-                    m0 = _mad_normalized(Wj[pre_idx_clip])
-                    m1 = _mad_normalized(Wj[post_idx_clip])
-                    features[f"wav_{fam}_L{j}_var_logratio"] = float(np.log(v1 / v0))
-                    features[f"wav_{fam}_L{j}_mad_logratio"] = float(np.log(m1 / m0))
-
-    # 3. Cross-scale summaries
-    all_max = [features[f"j{j}_local_max"] for j in range(1, actual_J + 1) if f"j{j}_local_max" in features]
-    all_exceed = [features[f"j{j}_exceed_count"] for j in range(1, actual_J + 1) if f"j{j}_exceed_count" in features]
-    all_energy = [features[f"j{j}_energy"] for j in range(1, actual_J + 1) if f"j{j}_energy" in features]
+        # 3. Cross-scale summaries (per-family)
+        all_max = [features[f"j{j}_local_max"] for j in range(1, actual_J + 1) if f"j{j}_local_max" in features]
+        all_exceed = [features[f"j{j}_exceed_count"] for j in range(1, actual_J + 1) if f"j{j}_exceed_count" in features]
+        all_energy = [features[f"j{j}_energy"] for j in range(1, actual_J + 1) if f"j{j}_energy" in features]
     
     features["S_local_max_over_j"] = float(np.max(all_max)) if all_max else 0.0
     features["cnt_local_sum_over_j"] = float(np.sum(all_exceed)) if all_exceed else 0.0
     features["energy_sum_over_j"] = float(np.sum(all_energy)) if all_energy else 0.0
     
-    # 4. Segment contrasts (pre vs post)
+    # 4. Segment contrasts (pre vs post) (family-agnostic)
     if len(x_pre) > 0 and len(x_post) > 0:
         # Energy ratios
         energy_pre = np.sum(x_pre ** 2)
@@ -659,6 +758,61 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         ks_stat_abs, ks_p_abs = ks_2samp(np.abs(x_pre), np.abs(x_post))
         features["ks_stat_abs"] = float(ks_stat_abs)
         features["ks_p_abs"] = float(ks_p_abs)
+
+    # 4b. Boundary-local features (Step 3) using coef-domain SWT when possible
+    try:
+        fam = cfg.wavelet
+        windows = getattr(cfg, "windows", (16, 32, 64)) or ()
+        if len(windows) > 0:
+            # Choose source: SWT details on residuals if usable, else recon per-level signals
+            dj = _swt_detail_coeffs(resid, fam, cfg.J)
+            swt_usable = bool(dj) and all(isinstance(v, np.ndarray) and v.size > 1 for v in dj.values())
+            # Boundary index from periods
+            dper = per.astype(int)
+            diffs = np.diff(dper)
+            idx = np.where(diffs != 0)[0]
+            B = int(idx[0] + 1) if idx.size else int(len(dper) // 2)
+            for j in range(1, min(cfg.J, 8) + 1):
+                if swt_usable and (j in dj):
+                    sig = dj[j]
+                else:
+                    sig = _dwt_level_reconstruction(resid, wavelet=fam, level=j, J=cfg.J)
+                n_sig = sig.size
+                if n_sig <= 1:
+                    continue
+                for w in windows:
+                    lo, hi = max(0, B - w), min(n_sig, B + w + 1)
+                    win = sig[lo:hi]
+                    if win.size == 0:
+                        continue
+                    # local maximum near boundary
+                    features[f"wav_{fam}_L{j}_localmax_w{w}"] = float(np.max(np.abs(win)))
+                    # threshold via cache or quick MC (gaussian under H0)
+                    qj = None
+                    if thr_cache is not None:
+                        cached = thr_cache.get(w, cfg.J, fam, cfg.alpha) or {}
+                        qj = cached.get(f"L{j}") if isinstance(cached, dict) else None
+                    if qj is None:
+                        # quick-and-limited MC to avoid runtime blowup
+                        rng = np.random.default_rng(cfg.random_state)
+                        reps = min(getattr(cfg, "mc_reps", 400), 400)
+                        draws = []
+                        J_eff = min(cfg.J, pywt.swt_max_level(max(2, win.size)))
+                        for _ in range(reps):
+                            z = rng.standard_normal(win.size)
+                            dj_win = _swt_detail_coeffs(z, fam, J_eff)
+                            if j in dj_win:
+                                draws.append(np.max(np.abs(dj_win[j])))
+                        if len(draws) > 0:
+                            qj = float(np.quantile(draws, 1.0 - cfg.alpha))
+                            if thr_cache is not None:
+                                cur = thr_cache.get(w, cfg.J, fam, cfg.alpha) or {}
+                                cur[f"L{j}"] = qj
+                                thr_cache.set(w, cfg.J, fam, cfg.alpha, cur)
+                    if qj is not None:
+                        features[f"wav_{fam}_L{j}_exceed_w{w}"] = float(np.sum(np.abs(win) > qj))
+    except Exception:
+        pass
     
     # 5. Residual diagnostics
     # Maintain existing arch_lm_p when available (for backward compatibility)
@@ -671,6 +825,17 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     # If residual-first path used, also expose h0_* diagnostics
     if cfg.use_residuals and cfg.null_model is not None and isinstance(h0_meta, dict):
         features.update(h0_meta_to_feats(h0_meta))
+        # Extra H0 diagnostics (Step 5)
+        try:
+            n_res = len(resid)
+            lag = max(1, min(10, n_res - 1))
+            features["h0_lb_p_resid2"] = float(_ljungbox_pvalue(np.asarray(resid, dtype=float) ** 2, lags=lag))
+        except Exception:
+            features["h0_lb_p_resid2"] = np.nan
+        try:
+            features["h0_kurtosis_resid"] = float(kurtosis(np.asarray(resid, dtype=float), fisher=True, bias=False))
+        except Exception:
+            features["h0_kurtosis_resid"] = np.nan
     
     # Ljung-Box tests at different lags (ensure lag < len(resid))
     n_resid = len(resid)
