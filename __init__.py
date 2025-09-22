@@ -51,8 +51,30 @@ def run_batch(input_parquet: str, out_pred_parquet: str, out_meta_parquet: str,
     elif method == 'wavelet21':
         from .methods.wavelet21.batch_processor import run_wavelet_batch
         return run_wavelet_batch(input_parquet, out_pred_parquet, out_meta_parquet, **kwargs)
+    elif method == 'tsfm':  # additive adapter for TSFM
+        # TSFM currently produces only predictors; create a minimal metadata file.
+        from .methods.TSFM.batch_processor import run_tsfm_batch
+        import pandas as _pd
+        preds = run_tsfm_batch(
+            input_parquet=input_parquet,
+            out_pred_parquet=out_pred_parquet,
+            n_ids=kwargs.get('n_ids'),
+            random_sample=kwargs.get('random_sample', False),
+            seed=kwargs.get('seed', 42),
+            cfg=kwargs.get('cfg'),
+        )
+        # Minimal metadata: just id index (preserves API contract without impacting Roy/Wavelet)
+        meta = _pd.DataFrame(index=preds.index).reset_index()[['id']]
+        from pathlib import Path as _Path
+        out_meta_p = _Path(out_meta_parquet)
+        out_meta_p.parent.mkdir(parents=True, exist_ok=True)
+        if out_meta_p.suffix.lower() == '.csv':
+            meta.to_csv(out_meta_p, index=False)
+        else:
+            meta.to_parquet(out_meta_p, index=False)
+        return preds, meta
     else:
-        raise ValueError(f"Unknown method: {method}. Choose 'roy24' or 'wavelet21'")
+        raise ValueError(f"Unknown method: {method}. Choose 'roy24', 'wavelet21', or 'tsfm'")
 
 
 def compute_predictors_for_values(values, periods, method: str = 'roy24', **kwargs) -> tuple:

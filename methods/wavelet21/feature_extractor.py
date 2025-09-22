@@ -311,7 +311,7 @@ def _modwt_coeffs(resid: np.ndarray, wavelet: str, J: int) -> Dict[int, np.ndarr
                 return out
 
         # Fallback to SWT with full-length detail coefficients
-        swt = pywt.swt(data, wavelet=wavelet, level=actual_J, trim_approx=True, norm=True)
+            swt = pywt.swt(data, wavelet=wavelet, level=actual_J, trim_approx=True, norm=True)
         return {j + 1: np.asarray(swt[j][1], dtype=float).reshape(-1) for j in range(len(swt))}
     except Exception as e:
         warnings.warn(f"Wavelet transform failed: {e}. Using identity transform.")
@@ -503,24 +503,24 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     
     # Use pre-period for residual modeling
     per1 = per[:-1] == 1
-
+    
     # Residual model under H0 (flag-controlled)
     if cfg.use_residuals and cfg.null_model is not None:
         try:
             resid, h0_meta = fit_null_model(values, cfg.null_model)
         except Exception:
             # Fallback to original ARMA residuals if null-model fitting fails
-            arma_resid = _arma_resid(x_pre)
-            p_arch = _arch_lm_pvalue(arma_resid, lags=10)
+    arma_resid = _arma_resid(x_pre)
+    p_arch = _arch_lm_pvalue(arma_resid, lags=10)
             if p_arch < 0.05 and HAVE_ARCH:
-                try:
-                    am = arch_model(arma_resid, vol='Garch', p=1, q=1, dist='t')
-                    r = am.fit()
-                    resid = r.std_resid
-                except Exception:
-                    resid = arma_resid
-            else:
+            try:
+                am = arch_model(arma_resid, vol='Garch', p=1, q=1, dist='t')
+                r = am.fit()
+                resid = r.std_resid
+            except Exception:
                 resid = arma_resid
+        else:
+            resid = arma_resid
             h0_meta = {"ljungbox_p": np.nan, "archlm_p": np.nan, "law": "normal", "nu": np.nan}
     else:
         arma_resid = _arma_resid(x_pre)
@@ -531,7 +531,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
                 r = am.fit()
                 resid = r.std_resid
             except Exception:
-                resid = arma_resid
+        resid = arma_resid
         else:
             resid = arma_resid
         h0_meta = {"ljungbox_p": np.nan, "archlm_p": np.nan, "law": "normal", "nu": np.nan}
@@ -544,66 +544,66 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     for fam in families:
         # MODWT/SWT coefficients (for summaries)
         W = _modwt_coeffs(resid, wavelet=fam, J=cfg.J)
-        # Get actual J used (may be less than requested)
-        actual_J = len(W)
-        
-        # Thresholds (MC or universal) with bucketing by residual length
-        n_resid = len(resid)
-        bucket_n = (n_resid // cfg.length_bucket) * cfg.length_bucket
-        bucket_n = max(bucket_n, cfg.length_bucket)
-        
-        if cfg.use_mc_thresholds:
-            thresholds = _get_thresholds(bucket_n, cfg.J, cfg.wavelet, cfg.alpha, thr_cache, cfg)
-        else:
-            # Universal thresholds (simplified)
-            thresholds = {j: 2.0 * np.sqrt(2 * np.log(n_resid)) for j in range(1, actual_J + 1)}
-        
+    # Get actual J used (may be less than requested)
+    actual_J = len(W)
+    
+    # Thresholds (MC or universal) with bucketing by residual length
+    n_resid = len(resid)
+    bucket_n = (n_resid // cfg.length_bucket) * cfg.length_bucket
+    bucket_n = max(bucket_n, cfg.length_bucket)
+    
+    if cfg.use_mc_thresholds:
+        thresholds = _get_thresholds(bucket_n, cfg.J, cfg.wavelet, cfg.alpha, thr_cache, cfg)
+    else:
+        # Universal thresholds (simplified)
+        thresholds = {j: 2.0 * np.sqrt(2 * np.log(n_resid)) for j in range(1, actual_J + 1)}
+    
         if 'features' not in locals():
-            features = {}
-        
-        # 1. Scale-specific local maxima and exceedances
-        for j in range(1, actual_J + 1):
-            if j not in W:
-                continue  # Skip if this level doesn't exist
+    features = {}
+    
+    # 1. Scale-specific local maxima and exceedances
+    for j in range(1, actual_J + 1):
+        if j not in W:
+            continue  # Skip if this level doesn't exist
             
-            # Get detail coefficients robustly (as per PDF instructions)
-            Wj_raw = W[j]
-            if isinstance(Wj_raw, tuple):
-                Wj_raw = Wj_raw[1]  # detail (cD)
-            Wj = np.asarray(Wj_raw).reshape(-1)
-            nj = Wj.size
+        # Get detail coefficients robustly (as per PDF instructions)
+        Wj_raw = W[j]
+        if isinstance(Wj_raw, tuple):
+            Wj_raw = Wj_raw[1]  # detail (cD)
+        Wj = np.asarray(Wj_raw).reshape(-1)
+        nj = Wj.size
         
         # Optional debug
         # logging.debug(f"Level {j}: Wj_raw type={type(Wj_raw)}, Wj shape={Wj.shape}, nj={nj}")
         
-            if nj == 0:
-                logging.warning(f"Level {j}: Empty coefficients, skipping")
-                continue
+        if nj == 0:
+            logging.warning(f"Level {j}: Empty coefficients, skipping")
+            continue
             
-            thresh_j = thresholds.get(j, 2.0 * np.sqrt(2 * np.log(n_resid)))
+        thresh_j = thresholds.get(j, 2.0 * np.sqrt(2 * np.log(n_resid)))
         
-            # Exceedance fraction
-            exceed_count = int(np.sum(np.abs(Wj) > thresh_j))
-            features[f"j{j}_exceed_count"] = float(exceed_count)
-            features[f"j{j}_exceed_frac"] = exceed_count / float(nj)
+        # Exceedance fraction
+        exceed_count = int(np.sum(np.abs(Wj) > thresh_j))
+        features[f"j{j}_exceed_count"] = float(exceed_count)
+        features[f"j{j}_exceed_frac"] = exceed_count / float(nj)
         
-            # Localized stats (avoid reusing Wj - use Wj_win for windowed analysis)
-            # For boundary analysis, use a window around the boundary
-            win_lo = max(0, nj // 2 - 10)
-            win_hi = min(nj, nj // 2 + 10)
-            Wj_win = Wj[win_lo:win_hi]
-            S_j = float(np.max(np.abs(Wj_win))) if Wj_win.size else 0.0
-            features[f"j{j}_S_local_max"] = S_j
+        # Localized stats (avoid reusing Wj - use Wj_win for windowed analysis)
+        # For boundary analysis, use a window around the boundary
+        win_lo = max(0, nj // 2 - 10)
+        win_hi = min(nj, nj // 2 + 10)
+        Wj_win = Wj[win_lo:win_hi]
+        S_j = float(np.max(np.abs(Wj_win))) if Wj_win.size else 0.0
+        features[f"j{j}_S_local_max"] = S_j
         
-            # Local maxima over threshold (using full array)
-            local_max = np.max(Wj)
-            features[f"j{j}_local_max"] = float(local_max)
-            features[f"j{j}_exceeds_thresh"] = float(local_max > thresh_j)
+        # Local maxima over threshold (using full array)
+        local_max = np.max(Wj)
+        features[f"j{j}_local_max"] = float(local_max)
+        features[f"j{j}_exceeds_thresh"] = float(local_max > thresh_j)
         
-            # Energy (using full array)
-            energy_j = float(np.sum(Wj * Wj))
-            features[f"j{j}_energy"] = energy_j
-            features[f"j{j}_energy_norm"] = float(energy_j / nj)
+        # Energy (using full array)
+        energy_j = float(np.sum(Wj * Wj))
+        features[f"j{j}_energy"] = energy_j
+        features[f"j{j}_energy_norm"] = float(energy_j / nj)
     
         # 2. Period-aware contrasts on residuals (only when residuals path is active)
         if cfg.use_residuals and cfg.null_model is not None:
@@ -724,9 +724,9 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
                                 pass
 
         # 3. Cross-scale summaries (per-family)
-        all_max = [features[f"j{j}_local_max"] for j in range(1, actual_J + 1) if f"j{j}_local_max" in features]
-        all_exceed = [features[f"j{j}_exceed_count"] for j in range(1, actual_J + 1) if f"j{j}_exceed_count" in features]
-        all_energy = [features[f"j{j}_energy"] for j in range(1, actual_J + 1) if f"j{j}_energy" in features]
+    all_max = [features[f"j{j}_local_max"] for j in range(1, actual_J + 1) if f"j{j}_local_max" in features]
+    all_exceed = [features[f"j{j}_exceed_count"] for j in range(1, actual_J + 1) if f"j{j}_exceed_count" in features]
+    all_energy = [features[f"j{j}_energy"] for j in range(1, actual_J + 1) if f"j{j}_energy" in features]
     
     features["S_local_max_over_j"] = float(np.max(all_max)) if all_max else 0.0
     features["cnt_local_sum_over_j"] = float(np.sum(all_exceed)) if all_exceed else 0.0
@@ -758,7 +758,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
         ks_stat_abs, ks_p_abs = ks_2samp(np.abs(x_pre), np.abs(x_post))
         features["ks_stat_abs"] = float(ks_stat_abs)
         features["ks_p_abs"] = float(ks_p_abs)
-
+    
     # 4b. Boundary-local features (Step 3) using coef-domain SWT when possible
     try:
         fam = cfg.wavelet
