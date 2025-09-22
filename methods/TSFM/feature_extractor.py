@@ -12,7 +12,11 @@ from typing import Dict, Optional, Tuple, Iterable, List
 import numpy as np
 import pandas as pd
 
-from .config import TSFMConfig
+# Allow standalone loading (e.g., Colab with sys.path set to .../methods)
+try:  # preferred relative import when part of package
+    from .config import TSFMConfig
+except Exception:  # fallback absolute import when loaded standalone
+    from TSFM.config import TSFMConfig  # type: ignore
 
 
 # -----------------------------

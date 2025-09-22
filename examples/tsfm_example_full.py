@@ -12,11 +12,16 @@ from typing import Optional
 import pandas as pd
 from tqdm import tqdm
 
-# Prefer absolute import via package; fallback to local repo-relative path
+# Prefer absolute import via package; fallback to methods/ path only (avoids package root)
 try:
     from StructualBreakV2.methods.TSFM.feature_extractor import TSFMConfig, extract_tsfm_predictors
 except Exception:  # pragma: no cover
-    from methods.TSFM.feature_extractor import TSFMConfig, extract_tsfm_predictors
+    import sys, os
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    methods_path = os.path.join(repo_root, "methods")
+    if methods_path not in sys.path:
+        sys.path.insert(0, methods_path)
+    from TSFM.feature_extractor import TSFMConfig, extract_tsfm_predictors
 
 
 def run_training(
