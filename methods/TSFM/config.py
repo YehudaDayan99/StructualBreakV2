@@ -16,5 +16,8 @@ class TSFMConfig:
     max_context: int = 1024
     max_horizon: int = 512
     use_quantiles: bool = False
+    # Mixed precision/inference acceleration (operational; minimal numeric drift)
+    use_mixed_precision: bool = True
+    amp_dtype: str = "bfloat16"  # "bfloat16" or "float16"
 
 

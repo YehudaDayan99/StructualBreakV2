@@ -116,12 +116,27 @@ class _TimesFMForecaster:
         return bestL or min(len(x0), max(grid))
 
     def forecast(self, x0: np.ndarray, H: int, L_star: Optional[int] = None,
-                 return_quantiles: bool = True) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+                 return_quantiles: bool = True,
+                 use_mixed_precision: bool = True,
+                 amp_dtype: str = "bfloat16") -> Tuple[np.ndarray, Optional[np.ndarray]]:
         # Cap horizon to avoid ValueError when H > compiled max_horizon
         H_use = int(min(int(H), self.max_horizon))
         L = L_star or self.pick_best_ctx(x0, H_use)
         ctx = x0[-L:].astype(np.float32)
-        pf, qf = self.model.forecast(horizon=H_use, inputs=[ctx])
+        # Optional mixed precision + inference mode (CUDA only)
+        pf = qf = None
+        try:
+            import torch  # type: ignore
+            if use_mixed_precision and torch.cuda.is_available():
+                dtype = torch.bfloat16 if amp_dtype.lower() == "bfloat16" else torch.float16
+                with torch.inference_mode():
+                    with torch.autocast(device_type="cuda", dtype=dtype):
+                        pf, qf = self.model.forecast(horizon=H_use, inputs=[ctx])
+            else:
+                pf, qf = self.model.forecast(horizon=H_use, inputs=[ctx])
+        except Exception:
+            # Fallback to standard path if torch not available or autocast fails
+            pf, qf = self.model.forecast(horizon=H_use, inputs=[ctx])
         point = np.asarray(pf[0], dtype=np.float32)
         quants = np.asarray(qf[0]) if (return_quantiles and qf is not None) else None
         return point, quants
@@ -272,7 +287,14 @@ _GLOBAL_FC_CACHE: dict = {}
 
 def _make_forecaster(cfg: TSFMConfig):
     """Create or reuse a process-global forecaster to avoid reloading models per id."""
-    key = (cfg.engine, int(cfg.max_context), int(cfg.max_horizon), bool(cfg.use_quantiles))
+    key = (
+        cfg.engine,
+        int(cfg.max_context),
+        int(cfg.max_horizon),
+        bool(cfg.use_quantiles),
+        bool(getattr(cfg, "use_mixed_precision", True)),
+        str(getattr(cfg, "amp_dtype", "bfloat16")),
+    )
     fc = _GLOBAL_FC_CACHE.get(key)
     if fc is not None:
         return fc
@@ -303,12 +325,26 @@ def extract_tsfm_predictors(values: np.ndarray, periods: np.ndarray, cfg: TSFMCo
     forecaster = _make_forecaster(cfg)
     # Pick context length on x0 tail, forecast x1
     Lstar = forecaster.pick_best_ctx(x0, H)
-    pf, qf = forecaster.forecast(x0, H, L_star=Lstar, return_quantiles=cfg.use_quantiles)
+    pf, qf = forecaster.forecast(
+        x0,
+        H,
+        L_star=Lstar,
+        return_quantiles=cfg.use_quantiles,
+        use_mixed_precision=getattr(cfg, "use_mixed_precision", True),
+        amp_dtype=getattr(cfg, "amp_dtype", "bfloat16"),
+    )
 
     # Pseudo-horizon on Period-0 tail for calibration/tests
     Hs = max(8, min(H, int(getattr(forecaster, "max_horizon", H)), int(0.25 * len(x0))))
     L2 = min(Lstar, max(1, len(x0) - Hs))
-    pf0, _ = forecaster.forecast(x0[:-Hs], Hs, L_star=L2, return_quantiles=False)
+    pf0, _ = forecaster.forecast(
+        x0[:-Hs],
+        Hs,
+        L_star=L2,
+        return_quantiles=False,
+        use_mixed_precision=getattr(cfg, "use_mixed_precision", True),
+        amp_dtype=getattr(cfg, "amp_dtype", "bfloat16"),
+    )
     x0_tail = x0[-Hs:]
 
     # Blocks
