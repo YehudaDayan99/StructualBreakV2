@@ -510,17 +510,17 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
             resid, h0_meta = fit_null_model(values, cfg.null_model)
         except Exception:
             # Fallback to original ARMA residuals if null-model fitting fails
-    arma_resid = _arma_resid(x_pre)
-    p_arch = _arch_lm_pvalue(arma_resid, lags=10)
+            arma_resid = _arma_resid(x_pre)
+            p_arch = _arch_lm_pvalue(arma_resid, lags=10)
             if p_arch < 0.05 and HAVE_ARCH:
-            try:
-                am = arch_model(arma_resid, vol='Garch', p=1, q=1, dist='t')
-                r = am.fit()
-                resid = r.std_resid
-            except Exception:
+                try:
+                    am = arch_model(arma_resid, vol='Garch', p=1, q=1, dist='t')
+                    r = am.fit()
+                    resid = r.std_resid
+                except Exception:
+                    resid = arma_resid
+            else:
                 resid = arma_resid
-        else:
-            resid = arma_resid
             h0_meta = {"ljungbox_p": np.nan, "archlm_p": np.nan, "law": "normal", "nu": np.nan}
     else:
         arma_resid = _arma_resid(x_pre)
@@ -531,7 +531,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
                 r = am.fit()
                 resid = r.std_resid
             except Exception:
-        resid = arma_resid
+                resid = arma_resid
         else:
             resid = arma_resid
         h0_meta = {"ljungbox_p": np.nan, "archlm_p": np.nan, "law": "normal", "nu": np.nan}
