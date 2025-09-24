@@ -73,6 +73,19 @@ class _PlaceholderForecaster:
         point = self._seasonal_naive(ctx, H).astype(float)
         return point, None
 
+    def forecast_batch(
+        self,
+        contexts: List[np.ndarray],
+        H: int,
+        return_quantiles: bool = False,
+        use_mixed_precision: bool = True,
+        amp_dtype: str = "bfloat16",
+    ) -> Tuple[List[np.ndarray], Optional[List[np.ndarray]]]:
+        points: List[np.ndarray] = []
+        for ctx in contexts:
+            points.append(self._seasonal_naive(np.asarray(ctx).reshape(-1), H).astype(float))
+        return points, None
+
 
 class _TimesFMForecaster:
     """Thin wrapper for TimesFM (optional)."""
@@ -140,6 +153,35 @@ class _TimesFMForecaster:
         point = np.asarray(pf[0], dtype=np.float32)
         quants = np.asarray(qf[0]) if (return_quantiles and qf is not None) else None
         return point, quants
+
+    def forecast_batch(
+        self,
+        contexts: List[np.ndarray],
+        H: int,
+        return_quantiles: bool = True,
+        use_mixed_precision: bool = True,
+        amp_dtype: str = "bfloat16",
+    ) -> Tuple[List[np.ndarray], Optional[List[np.ndarray]]]:
+        """Batch forecast for a list of contexts with the same horizon H.
+        Returns lists aligned to inputs. Quantiles optional.
+        """
+        H_use = int(min(int(H), self.max_horizon))
+        inputs = [np.asarray(c, dtype=np.float32).reshape(-1) for c in contexts]
+        pf = qf = None
+        try:
+            import torch  # type: ignore
+            if use_mixed_precision and torch.cuda.is_available():
+                dtype = torch.bfloat16 if amp_dtype.lower() == "bfloat16" else torch.float16
+                with torch.inference_mode():
+                    with torch.autocast(device_type="cuda", dtype=dtype):
+                        pf, qf = self.model.forecast(horizon=H_use, inputs=inputs)
+            else:
+                pf, qf = self.model.forecast(horizon=H_use, inputs=inputs)
+        except Exception:
+            pf, qf = self.model.forecast(horizon=H_use, inputs=inputs)
+        points = [np.asarray(p, dtype=np.float32) for p in pf]
+        quants = [np.asarray(q) for q in qf] if (return_quantiles and qf is not None) else None
+        return points, quants
 
 
 def _robust_scales(x0: np.ndarray) -> Tuple[float, float]:
@@ -361,3 +403,137 @@ def extract_tsfm_predictors(values: np.ndarray, periods: np.ndarray, cfg: TSFMCo
     return out
 
 
+def extract_tsfm_predictors_batch(
+    series_list: List[Tuple[np.ndarray, np.ndarray]],
+    cfg: TSFMConfig,
+) -> List[Dict[str, float]]:
+    """Batched variant: compute features for multiple series.
+    Each item is (values, periods) arrays.
+    Uses batch forecasts per equal horizon to utilize GPU better.
+    """
+    forecaster = _make_forecaster(cfg)
+    # Precompute splits and L* per id
+    entries = []  # holds dict per series with computed items
+    for idx, (values, periods) in enumerate(series_list):
+        v = np.asarray(values, dtype=float).reshape(-1)
+        p = np.asarray(periods, dtype=int).reshape(-1)
+        x0 = v[p == 0]
+        x1 = v[p == 1]
+        if (x0.size == 0) or (x1.size == 0):
+            entries.append({
+                "idx": idx,
+                "degenerate": True,
+                "x0": x0,
+                "x1": x1,
+            })
+            continue
+        H = int(x1.size)
+        Lstar = forecaster.pick_best_ctx(x0, H)
+        entries.append({
+            "idx": idx,
+            "degenerate": False,
+            "x0": x0,
+            "x1": x1,
+            "H": H,
+            "Lstar": Lstar,
+        })
+
+    # Batch forecast for Period-1 by horizon H
+    from collections import defaultdict
+    by_H: Dict[int, List[int]] = defaultdict(list)
+    for i, e in enumerate(entries):
+        if not e.get("degenerate", False):
+            by_H[int(e["H"])].append(i)
+    # For each H, build contexts list
+    pf_dict: Dict[int, np.ndarray] = {}
+    qf_dict: Dict[int, Optional[np.ndarray]] = {}
+    for H, idxs in by_H.items():
+        contexts = [entries[i]["x0"][-entries[i]["Lstar"]:] for i in idxs]
+        points, quants = None, None
+        if hasattr(forecaster, "forecast_batch"):
+            points, quants = forecaster.forecast_batch(
+                contexts,
+                H,
+                return_quantiles=cfg.use_quantiles,
+                use_mixed_precision=getattr(cfg, "use_mixed_precision", True),
+                amp_dtype=getattr(cfg, "amp_dtype", "bfloat16"),
+            )
+        else:
+            points = []
+            quants = [] if cfg.use_quantiles else None
+            for ctx in contexts:
+                p1, q1 = forecaster.forecast(
+                    ctx, H, L_star=len(ctx), return_quantiles=cfg.use_quantiles,
+                    use_mixed_precision=getattr(cfg, "use_mixed_precision", True),
+                    amp_dtype=getattr(cfg, "amp_dtype", "bfloat16"),
+                )
+                points.append(p1)
+                if cfg.use_quantiles and q1 is not None:
+                    quants.append(q1)
+        for j, i in enumerate(idxs):
+            pf_dict[i] = points[j]
+            qf_dict[i] = (quants[j] if (cfg.use_quantiles and quants is not None) else None)
+
+    # Pseudo-horizon on Period-0 tail, batched by Hs
+    by_Hs: Dict[int, List[int]] = defaultdict(list)
+    Hs_map: Dict[int, int] = {}
+    L2_map: Dict[int, int] = {}
+    for i, e in enumerate(entries):
+        if e.get("degenerate", False):
+            continue
+        x0 = e["x0"]
+        H = e["H"]
+        Hs = max(8, min(H, int(getattr(forecaster, "max_horizon", H)), int(0.25 * len(x0))))
+        L2 = min(e["Lstar"], max(1, len(x0) - Hs))
+        Hs_map[i] = Hs
+        L2_map[i] = L2
+        by_Hs[int(Hs)].append(i)
+
+    pf0_dict: Dict[int, np.ndarray] = {}
+    for Hs, idxs in by_Hs.items():
+        contexts0 = [entries[i]["x0"][: -Hs][-L2_map[i]:] for i in idxs]
+        points0, _ = None, None
+        if hasattr(forecaster, "forecast_batch"):
+            points0, _ = forecaster.forecast_batch(
+                contexts0,
+                Hs,
+                return_quantiles=False,
+                use_mixed_precision=getattr(cfg, "use_mixed_precision", True),
+                amp_dtype=getattr(cfg, "amp_dtype", "bfloat16"),
+            )
+        else:
+            points0 = []
+            for ctx in contexts0:
+                p0, _ = forecaster.forecast(
+                    ctx, Hs, L_star=len(ctx), return_quantiles=False,
+                    use_mixed_precision=getattr(cfg, "use_mixed_precision", True),
+                    amp_dtype=getattr(cfg, "amp_dtype", "bfloat16"),
+                )
+                points0.append(p0)
+        for j, i in enumerate(idxs):
+            pf0_dict[i] = points0[j]
+
+    # Assemble features
+    out_list: List[Dict[str, float]] = []
+    for i, e in enumerate(entries):
+        if e.get("degenerate", False):
+            out_list.append({"mae_full": np.nan})
+            continue
+        x0 = e["x0"]; x1 = e["x1"]
+        pf = pf_dict[i]
+        pf0 = pf0_dict[i]
+        # Blocks
+        A = _block_A(pf, x1, x0)
+        B = _block_B(pf, x1, x0)
+        Hs = Hs_map[i]
+        x0_tail = x0[-Hs:]
+        C = _block_C(pf0, x0_tail, pf, x1)
+        res_p0 = x0_tail - pf0
+        res_p1 = x1 - pf
+        D = _block_D(res_p0, res_p1)
+        qf = qf_dict.get(i)
+        E = _block_E(qf, x1) if cfg.use_quantiles else {}
+        out: Dict[str, float] = {"ctx_len": float(e["Lstar"]) }
+        out.update(A); out.update(B); out.update(C); out.update(D); out.update(E)
+        out_list.append(out)
+    return out_list

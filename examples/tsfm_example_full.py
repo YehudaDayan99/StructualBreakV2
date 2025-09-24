@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 # Prefer absolute import via package; fallback to methods/ path only (avoids package root)
 try:
-    from StructualBreakV2.methods.TSFM.feature_extractor import TSFMConfig, extract_tsfm_predictors
+    from StructualBreakV2.methods.TSFM.feature_extractor import TSFMConfig, extract_tsfm_predictors, extract_tsfm_predictors_batch
 except Exception:  # pragma: no cover
     import sys, os
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -57,15 +57,43 @@ def run_training(
             sel_ids = all_ids[:n_ids]
     print(f"Processing {len(sel_ids)} ids (out of {len(all_ids)}) ...")
 
-    rows = []
-    for id_ in tqdm(sel_ids, desc="TSFM (ids)", total=len(sel_ids)):
+    # Bucket ids by similar horizon H to batch forecasts
+    # Build (values, periods) per id
+    series_map = {}
+    for id_ in sel_ids:
         df = X.xs(id_, level=0)
-        vals = df["value"].to_numpy(float)
-        per = df["period"].to_numpy(int)
+        series_map[id_] = (df["value"].to_numpy(float), df["period"].to_numpy(int))
+
+    # Simple horizon buckets
+    def horizon_for(id_):
+        per = series_map[id_][1]
+        return int((per == 1).sum())
+
+    buckets = {128: [], 256: [], 512: [], 1024: [], 10_000: []}
+    for id_ in sel_ids:
+        H = horizon_for(id_)
+        if H <= 128:
+            buckets[128].append(id_)
+        elif H <= 256:
+            buckets[256].append(id_)
+        elif H <= 512:
+            buckets[512].append(id_)
+        elif H <= 1024:
+            buckets[1024].append(id_)
+        else:
+            buckets[10_000].append(id_)
+
+    rows = []
+    for cap, ids in buckets.items():
+        if not ids:
+            continue
+        batch = [series_map[i] for i in ids]
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            feats = extract_tsfm_predictors(vals, per, cfg=cfg)
-        feats["id"] = id_
-        rows.append(feats)
+            feats_list = extract_tsfm_predictors_batch(batch, cfg=cfg)
+        for i, id_ in enumerate(ids):
+            feats = feats_list[i]
+            feats["id"] = id_
+            rows.append(feats)
 
     F = pd.DataFrame(rows).set_index("id").sort_index()
     out_path_p = Path(out_path)
