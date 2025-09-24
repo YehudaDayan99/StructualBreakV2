@@ -101,18 +101,24 @@ def run_training(
                 prep_futures[cap] = ex.submit(make_batch, ids)
 
         rows = []
-        # Consume in deterministic cap order
-        for cap in [128, 256, 512, 1024, 10_000]:
-            ids = buckets.get(cap, [])
-            if not ids:
-                continue
-            batch = prep_futures[cap].result()
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                feats_list = extract_tsfm_predictors_batch(batch, cfg=cfg)
-            for i, id_ in enumerate(ids):
-                feats = feats_list[i]
-                feats["id"] = id_
-                rows.append(feats)
+        # Consume in deterministic cap order with progress per batch
+        from tqdm import tqdm as _tqdm
+        progress = _tqdm(total=len(sel_ids), desc="TSFM (ids)")
+        try:
+            for cap in [128, 256, 512, 1024, 10_000]:
+                ids = buckets.get(cap, [])
+                if not ids:
+                    continue
+                batch = prep_futures[cap].result()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    feats_list = extract_tsfm_predictors_batch(batch, cfg=cfg)
+                for i, id_ in enumerate(ids):
+                    feats = feats_list[i]
+                    feats["id"] = id_
+                    rows.append(feats)
+                progress.update(len(ids))
+        finally:
+            progress.close()
 
     F = pd.DataFrame(rows).set_index("id").sort_index()
     out_path_p = Path(out_path)
