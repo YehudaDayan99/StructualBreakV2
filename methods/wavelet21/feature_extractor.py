@@ -557,8 +557,7 @@ def _wavelet_features_for_series(values: np.ndarray, periods: np.ndarray,
     else:
         # Universal thresholds (simplified)
         thresholds = {j: 2.0 * np.sqrt(2 * np.log(n_resid)) for j in range(1, actual_J + 1)}
-    
-        if 'features' not in locals():
+
     features = {}
     
     # 1. Scale-specific local maxima and exceedances
