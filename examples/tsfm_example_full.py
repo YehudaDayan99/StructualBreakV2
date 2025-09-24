@@ -31,6 +31,9 @@ def run_training(
     n_ids: Optional[int] = None,
     random_sample: bool = False,
     seed: int = 42,
+    shard_offset: int = 0,
+    shard_size: Optional[int] = None,
+    resume_append: bool = True,
 ) -> None:
     print("\n[TSFM] Training run: loading X ...")
     X = pd.read_parquet(x_path)
@@ -47,14 +50,19 @@ def run_training(
 
     all_ids = X.index.get_level_values(0).unique().tolist()
     if (n_ids is None) or (n_ids <= 0) or (n_ids >= len(all_ids)):
-        sel_ids = all_ids
+        base_ids = all_ids
     else:
         if random_sample:
             import numpy as np
             rng = np.random.default_rng(seed)
-            sel_ids = list(rng.choice(all_ids, size=n_ids, replace=False))
+            base_ids = list(rng.choice(all_ids, size=n_ids, replace=False))
         else:
-            sel_ids = all_ids[:n_ids]
+            base_ids = all_ids[:n_ids]
+    # Apply sharding window if requested
+    if shard_size is not None and shard_size > 0:
+        sel_ids = base_ids[shard_offset: shard_offset + shard_size]
+    else:
+        sel_ids = base_ids
     print(f"Processing {len(sel_ids)} ids (out of {len(all_ids)}) ...")
 
     # Build (values, periods) per id using a single groupby (faster than many xs)
@@ -74,14 +82,11 @@ def run_training(
         per = series_map[id_][1]
         return int((per == 1).sum())
 
-    buckets = {128: [], 256: [], 512: [], 1024: [], 10_000: []}
+    # Coarser buckets to increase batch sizes
+    buckets = {512: [], 1024: [], 10_000: []}
     for id_ in sel_ids:
         H = horizon_for(id_)
-        if H <= 128:
-            buckets[128].append(id_)
-        elif H <= 256:
-            buckets[256].append(id_)
-        elif H <= 512:
+        if H <= 512:
             buckets[512].append(id_)
         elif H <= 1024:
             buckets[1024].append(id_)
@@ -91,7 +96,8 @@ def run_training(
     # Parallel input prep: prebuild batches in threads to overlap with GPU compute
     from concurrent.futures import ThreadPoolExecutor, as_completed
     def make_batch(ids):
-        return [series_map[i] for i in ids]
+        # include id as 3rd element so L* cache can persist per-id
+        return [(series_map[i][0], series_map[i][1], str(i)) for i in ids]
 
     # Prepare batches concurrently
     prep_futures = {}
@@ -105,7 +111,7 @@ def run_training(
         from tqdm import tqdm as _tqdm
         progress = _tqdm(total=len(sel_ids), desc="TSFM (ids)")
         try:
-            for cap in [128, 256, 512, 1024, 10_000]:
+            for cap in [512, 1024, 10_000]:
                 ids = buckets.get(cap, [])
                 if not ids:
                     continue
@@ -123,7 +129,18 @@ def run_training(
     F = pd.DataFrame(rows).set_index("id").sort_index()
     out_path_p = Path(out_path)
     out_path_p.parent.mkdir(parents=True, exist_ok=True)
-    F.to_csv(out_path_p)
-    print(f"Saved {out_path} with shape {F.shape}")
+    if resume_append and out_path_p.exists():
+        # Append new rows without duplicating existing ids
+        try:
+            F_prev = pd.read_csv(out_path_p).set_index("id")
+            F_combined = pd.concat([F_prev[~F_prev.index.isin(F.index)], F]).sort_index()
+            F_combined.to_csv(out_path_p)
+            print(f"Appended to {out_path} (now {F_combined.shape})")
+        except Exception:
+            F.to_csv(out_path_p)
+            print(f"Saved {out_path} with shape {F.shape}")
+    else:
+        F.to_csv(out_path_p)
+        print(f"Saved {out_path} with shape {F.shape}")
 
 

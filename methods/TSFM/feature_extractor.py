@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Iterable, List
+import os, json
 
 import numpy as np
 import pandas as pd
@@ -411,9 +412,25 @@ def extract_tsfm_predictors_batch(
     Uses batch forecasts per equal horizon to utilize GPU better.
     """
     forecaster = _make_forecaster(cfg)
+    # Optional on-disk cache for L* per id (if caller provides id via series tuple 3rd elt)
+    cache_path = os.environ.get("TSFM_LSTAR_CACHE", "")
+    lstar_cache: Dict[str, int] = {}
+    if cache_path:
+        try:
+            if os.path.exists(cache_path):
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    lstar_cache = json.load(f)
+        except Exception:
+            lstar_cache = {}
     # Precompute splits and L* per id
     entries = []  # holds dict per series with computed items
-    for idx, (values, periods) in enumerate(series_list):
+    for idx, item in enumerate(series_list):
+        # item can be (values, periods) or (values, periods, id_str)
+        if len(item) == 3:
+            values, periods, id_str = item  # type: ignore
+        else:
+            values, periods = item  # type: ignore
+            id_str = None
         v = np.asarray(values, dtype=float).reshape(-1)
         p = np.asarray(periods, dtype=int).reshape(-1)
         x0 = v[p == 0]
@@ -427,7 +444,17 @@ def extract_tsfm_predictors_batch(
             })
             continue
         H = int(x1.size)
-        Lstar = forecaster.pick_best_ctx(x0, H)
+        # Use cached L* if available
+        Lstar = None
+        if id_str and id_str in lstar_cache:
+            try:
+                Lstar = int(lstar_cache[id_str])
+            except Exception:
+                Lstar = None
+        if Lstar is None:
+            Lstar = forecaster.pick_best_ctx(x0, H)
+            if id_str is not None and cache_path:
+                lstar_cache[id_str] = int(Lstar)
         entries.append({
             "idx": idx,
             "degenerate": False,
@@ -435,6 +462,7 @@ def extract_tsfm_predictors_batch(
             "x1": x1,
             "H": H,
             "Lstar": Lstar,
+            "id_str": id_str,
         })
 
     # Batch forecast for Period-1 by horizon H
@@ -535,4 +563,12 @@ def extract_tsfm_predictors_batch(
         out: Dict[str, float] = {"ctx_len": float(e["Lstar"]) }
         out.update(A); out.update(B); out.update(C); out.update(D); out.update(E)
         out_list.append(out)
+    # Persist L* cache if path provided
+    if cache_path and lstar_cache:
+        try:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(lstar_cache, f)
+        except Exception:
+            pass
     return out_list
