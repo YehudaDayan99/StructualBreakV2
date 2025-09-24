@@ -57,12 +57,17 @@ def run_training(
             sel_ids = all_ids[:n_ids]
     print(f"Processing {len(sel_ids)} ids (out of {len(all_ids)}) ...")
 
-    # Bucket ids by similar horizon H to batch forecasts
-    # Build (values, periods) per id
+    # Build (values, periods) per id using a single groupby (faster than many xs)
+    xr = X.reset_index()
+    g = xr.groupby('id', sort=False)
+    sel_set = set(sel_ids)
     series_map = {}
-    for id_ in sel_ids:
-        df = X.xs(id_, level=0)
-        series_map[id_] = (df["value"].to_numpy(float), df["period"].to_numpy(int))
+    for gid, gdf in g:
+        if gid in sel_set:
+            series_map[gid] = (
+                gdf["value"].to_numpy(dtype=float),
+                gdf["period"].to_numpy(dtype=int),
+            )
 
     # Simple horizon buckets
     def horizon_for(id_):

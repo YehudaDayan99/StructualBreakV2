@@ -329,13 +329,12 @@ _GLOBAL_FC_CACHE: dict = {}
 
 def _make_forecaster(cfg: TSFMConfig):
     """Create or reuse a process-global forecaster to avoid reloading models per id."""
+    # Cache key excludes mixed precision flags to avoid unnecessary recompiles
     key = (
         cfg.engine,
         int(cfg.max_context),
         int(cfg.max_horizon),
         bool(cfg.use_quantiles),
-        bool(getattr(cfg, "use_mixed_precision", True)),
-        str(getattr(cfg, "amp_dtype", "bfloat16")),
     )
     fc = _GLOBAL_FC_CACHE.get(key)
     if fc is not None:
