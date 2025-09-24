@@ -88,17 +88,31 @@ def run_training(
         else:
             buckets[10_000].append(id_)
 
-    rows = []
-    for cap, ids in buckets.items():
-        if not ids:
-            continue
-        batch = [series_map[i] for i in ids]
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            feats_list = extract_tsfm_predictors_batch(batch, cfg=cfg)
-        for i, id_ in enumerate(ids):
-            feats = feats_list[i]
-            feats["id"] = id_
-            rows.append(feats)
+    # Parallel input prep: prebuild batches in threads to overlap with GPU compute
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def make_batch(ids):
+        return [series_map[i] for i in ids]
+
+    # Prepare batches concurrently
+    prep_futures = {}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for cap, ids in buckets.items():
+            if ids:
+                prep_futures[cap] = ex.submit(make_batch, ids)
+
+        rows = []
+        # Consume in deterministic cap order
+        for cap in [128, 256, 512, 1024, 10_000]:
+            ids = buckets.get(cap, [])
+            if not ids:
+                continue
+            batch = prep_futures[cap].result()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                feats_list = extract_tsfm_predictors_batch(batch, cfg=cfg)
+            for i, id_ in enumerate(ids):
+                feats = feats_list[i]
+                feats["id"] = id_
+                rows.append(feats)
 
     F = pd.DataFrame(rows).set_index("id").sort_index()
     out_path_p = Path(out_path)
